@@ -574,6 +574,42 @@ for _p in DIRS.values():
     except Exception:
         pass
 
+# Persistent tombstones prevent background worker threads (process drain,
+# memory watcher, auto-restart, etc.) from resurrecting a bot after the user
+# deletes it.  A bot id remains tombstoned until an explicit new record with a
+# different id is created; this is intentionally separate from the bot DB so
+# a stale in-memory document can never recreate a deleted record.
+DELETED_BOTS_FILE = DIRS["data"] / "deleted_bots.json"
+_DELETED_BOTS_LOCK = threading.RLock()
+
+def _deleted_bot_ids() -> set:
+    try:
+        data = _load_json(DELETED_BOTS_FILE, {})
+        if isinstance(data, dict):
+            return {str(k) for k, v in data.items() if v}
+        if isinstance(data, list):
+            return {str(x) for x in data}
+    except Exception:
+        pass
+    return set()
+
+def _is_bot_deleted(bot_id: str) -> bool:
+    with _DELETED_BOTS_LOCK:
+        return str(bot_id) in _deleted_bot_ids()
+
+def _mark_bot_deleted(bot_id: str) -> None:
+    with _DELETED_BOTS_LOCK:
+        ids = _deleted_bot_ids()
+        ids.add(str(bot_id))
+        _atomic_write(DELETED_BOTS_FILE, {x: True for x in sorted(ids)})
+
+def _clear_bot_deleted(bot_id: str) -> None:
+    with _DELETED_BOTS_LOCK:
+        ids = _deleted_bot_ids()
+        if str(bot_id) in ids:
+            ids.remove(str(bot_id))
+            _atomic_write(DELETED_BOTS_FILE, {x: True for x in sorted(ids)})
+
 DB_FILE       = DIRS["data"] / "panel_db.json"
 SETTINGS_FILE = DIRS["data"] / "panel_settings.json"
 AUDIT_FILE    = DIRS["data"] / "audit.log"
@@ -3053,7 +3089,9 @@ def _watch_child_memory(bot_id: str, pid: int, ram_mb: int) -> None:
             return
 
 def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
-    bid = b["_id"]
+    bid = str(b["_id"])
+    if _is_bot_deleted(bid):
+        return {"ok": False, "error": "Bot was deleted."}
     owner_doc = db_load().get("users", {}).get(str(b.get("owner")), {})
     if not user_plan_active(owner_doc):
         return {"ok": False, "error": "Your hosting plan is expired. Upgrade to start this bot."}
@@ -3159,6 +3197,14 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     b["last_started"] = ts_iso()
     b["last_error"] = ""
     b["last_exit_code"] = None
+    if _is_bot_deleted(bid):
+        # Deletion won the race while the child was starting. Stop it and do
+        # not recreate the DB record.
+        try:
+            stop_child(bid, manual=True)
+        except Exception:
+            pass
+        return {"ok": False, "error": "Bot was deleted during startup"}
     save_bot(b)
     return {"ok": True, "pid": proc.pid, "kind": kind}
 
@@ -4292,17 +4338,21 @@ def find_bot(bot_id: str) -> Optional[Dict[str, Any]]:
 
 
 def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist a bot without allowing stale runtime documents to erase ENV.
+    """Persist a bot without allowing stale workers to resurrect deletions.
 
     ENV is independently managed by _persist_bot_env().  Runtime status updates
-    often operate on an older copy of a bot document (especially around plan
-    activation/startup).  If that stale copy contains env={}, blindly saving it
-    would erase perfectly valid paid-user ENV variables.  Merge the current
-    authoritative ENV before saving; an explicit ENV deletion is performed
-    through _persist_bot_env(), not through save_bot().
+    often operate on older copies of a bot document.  A persistent delete
+    tombstone is checked before *any* save, so a late worker callback cannot
+    recreate a record that the user already removed.
     """
-    d = db_load()
     bid = str(doc["_id"])
+    if _is_bot_deleted(bid):
+        # Deliberately do not raise: background threads may call save_bot()
+        # after deletion. Returning the document keeps those workers harmless.
+        return doc
+    with _db_lock:
+        d = _cached_load(DB_FILE, {})
+        d = _ensure_db_defaults(copy.deepcopy(d))
     existing = d.get("bots", {}).get(bid) or {}
     incoming = copy.deepcopy(doc)
 
@@ -4321,7 +4371,11 @@ def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
     incoming["env_keys"] = sorted(authoritative_env.keys(), key=str.upper)
 
     d["bots"][bid] = incoming
-    db_save(d)
+    # We already hold _db_lock; write directly to avoid releasing the lock
+    # between the read and write. This prevents concurrent status updates from
+    # losing a deletion or another bot's update.
+    _atomic_write(DB_FILE, _encrypt_db_copy(d))
+    _cache_invalidate(DB_FILE)
     try:
         _write_env_sidecar(bid, authoritative_env)
     except Exception:
@@ -4349,10 +4403,18 @@ def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def delete_bot_doc(bot_id: str) -> None:
-    d = db_load()
-    d["bots"].pop(bot_id, None)
-    db_save(d)
-    # Per-bot JSON bhi delete karo
+    # Mark the id BEFORE touching the DB. Any worker that wakes between the
+    # stop request and the DB deletion is therefore prevented from saving the
+    # stale document back.
+    _mark_bot_deleted(bot_id)
+    with _db_lock:
+        d = _cached_load(DB_FILE, {})
+        d = _ensure_db_defaults(copy.deepcopy(d))
+        d["bots"].pop(str(bot_id), None)
+        _atomic_write(DB_FILE, _encrypt_db_copy(d))
+        _cache_invalidate(DB_FILE)
+    # Remove local metadata/ENV. Source files are intentionally left alone for
+    # the existing "Delete Record" semantics; Delete Everything removes them.
     try:
         (DIRS["bot_data"] / f"{bot_id}.json").unlink(missing_ok=True)
         _env_sidecar_path(bot_id).unlink(missing_ok=True)
@@ -12693,6 +12755,9 @@ def action_bot_delete(call: types.CallbackQuery, bot_id: str) -> None:
     b = find_bot(bot_id)
     if not b or (b["owner"] != call.from_user.id and not is_admin(call.from_user.id)):
         ack(call, "Not yours"); return
+    # Tombstone first so a background worker cannot resurrect this bot while
+    # the child process is being stopped.
+    _mark_bot_deleted(bot_id)
     stop_child(bot_id, manual=True)
     delete_bot_doc(bot_id)
     audit(call.from_user.id, "bot_delete", f"bot={bot_id}")
@@ -12754,6 +12819,7 @@ def action_bot_delall(call: types.CallbackQuery, bot_id: str) -> None:
     b = find_bot(bot_id)
     if not b or (b["owner"] != call.from_user.id and not is_admin(call.from_user.id)):
         ack(call, "Not yours"); return
+    _mark_bot_deleted(bot_id)
     stop_child(bot_id, manual=True)
     try:
         rmrf(b.get("dir", ""))
