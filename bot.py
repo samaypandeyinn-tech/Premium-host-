@@ -650,17 +650,17 @@ if not TOKEN:
 # automatically becomes the panel owner and is persisted to settings.
 # This lets you deploy with ONLY BOT_TOKEN and claim ownership in one tap.
 
-ANNOUNCE_CHANNEL = "@KRYON_JI"
+ANNOUNCE_CHANNEL = "@TNL_NETWORK"
 try:
     KEEPALIVE_PORT = int(os.environ.get("PORT", 10460))
 except (TypeError, ValueError):
     KEEPALIVE_PORT = 10000
 
-BRAND       = "𓂀KRYON_HOST𓂀"
+BRAND       = "ᴛɴʟ Cʟᴏᴜᴅ Hᴏꜱᴛ"
 BRAND_VER   = "v1.0"
 BRAND_TAG   = f"{BRAND} {BRAND_VER}"
 SUPPORT_USR = "@FLEXSAMAY"
-UPDATE_CH   = "https://t.me/KRYON_JI"
+UPDATE_CH   = "https://t.me/TNL_NETWORK"
 FOOTER      = f"\n\n<blockquote>{BRAND_TAG}</blockquote>"
 
 # ─── glyphs (smart contextual symbols + emojis for the UI) ──────
