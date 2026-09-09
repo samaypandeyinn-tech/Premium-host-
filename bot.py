@@ -39,6 +39,7 @@ _REQUIRED_PKGS = [
     ("psutil",              "psutil"),
     ("PIL",                 "Pillow"),
     ("qrcode",              "qrcode"),
+    ("pymongo",             "pymongo"),
 ]
 
 
@@ -635,11 +636,93 @@ for _secret_name in {
     "BHARATPE_MERCHANT_ID", "GITHUB_TOKEN", "GITHUB_REPO", "GITHUB_BRANCH",
     "GITHUB_KEY_REPO", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY",
     "AI_INTEGRATIONS_OPENROUTER_API_KEY", "SESSION_SECRET", "SECRET_KEY",
+    "MONGO_URI", "PANEL_MONGO_URI", "PANEL_MONGO_DB",
 }:
     _v = os.environ.get(_secret_name)
     if _v is not None:
         _HOST_SECRET_ENV[_secret_name] = str(_v).strip()
         os.environ.pop(_secret_name, None)
+
+
+# Optional durable panel database. Local JSON remains the fast cache, while
+# MongoDB becomes the recovery source across container rebuilds/redeploys.
+# Values are captured before host secrets are removed from os.environ.
+_PANEL_MONGO_URI = (_HOST_SECRET_ENV.get("PANEL_MONGO_URI")
+                    or _HOST_SECRET_ENV.get("MONGO_URI") or "").strip()
+_PANEL_MONGO_DB = (_HOST_SECRET_ENV.get("PANEL_MONGO_DB") or "kryon_host").strip() or "kryon_host"
+_MONGO_CLIENT = None
+_MONGO_DB = None
+_MONGO_LOCK = threading.RLock()
+
+def _mongo_db():
+    global _MONGO_CLIENT, _MONGO_DB
+    if not _PANEL_MONGO_URI:
+        return None
+    with _MONGO_LOCK:
+        if _MONGO_DB is not None:
+            return _MONGO_DB
+        try:
+            from pymongo import MongoClient
+            _MONGO_CLIENT = MongoClient(
+                _PANEL_MONGO_URI,
+                serverSelectionTimeoutMS=3000,
+                connectTimeoutMS=3000,
+                socketTimeoutMS=5000,
+                retryWrites=True,
+            )
+            _MONGO_CLIENT.admin.command("ping")
+            _MONGO_DB = _MONGO_CLIENT[_PANEL_MONGO_DB]
+            print(f"[persistence] MongoDB durable storage enabled: {_PANEL_MONGO_DB}", flush=True)
+            return _MONGO_DB
+        except Exception as e:
+            print(f"[persistence] MongoDB unavailable: {e}", flush=True)
+            _MONGO_CLIENT = None
+            _MONGO_DB = None
+            return None
+
+def _mongo_get(kind: str):
+    db = _mongo_db()
+    if db is None:
+        return None
+    try:
+        doc = db.panel_state.find_one({"_id": kind})
+        return copy.deepcopy(doc.get("data")) if doc else None
+    except Exception as e:
+        print(f"[persistence] Mongo read failed ({kind}): {e}", flush=True)
+        return None
+
+def _mongo_put(kind: str, data: Any) -> bool:
+    db = _mongo_db()
+    if db is None:
+        return False
+    try:
+        db.panel_state.replace_one({"_id": kind}, {"_id": kind, "updated_at": time.time(), "data": copy.deepcopy(data)}, upsert=True)
+        return True
+    except Exception as e:
+        print(f"[persistence] Mongo write failed ({kind}): {e}", flush=True)
+        return False
+
+def _durable_restore_on_boot() -> None:
+    """Recover local state from Mongo only when the local copy is absent/empty."""
+    if not _PANEL_MONGO_URI:
+        print("[persistence] No PANEL_MONGO_URI/MONGO_URI configured; local storage only.", flush=True)
+        return
+    try:
+        local = _load_json(DB_FILE, {}) if DB_FILE.exists() else {}
+        if not isinstance(local, dict) or not (local.get("users") or local.get("bots") or local.get("payments")):
+            remote = _mongo_get("db")
+            if isinstance(remote, dict) and remote:
+                _atomic_write(DB_FILE, remote)
+                print("[persistence] Restored panel DB from MongoDB.", flush=True)
+        local_s = _load_json(SETTINGS_FILE, {}) if SETTINGS_FILE.exists() else {}
+        if not isinstance(local_s, dict) or not local_s:
+            remote_s = _mongo_get("settings")
+            if isinstance(remote_s, dict) and remote_s:
+                _atomic_write(SETTINGS_FILE, remote_s)
+                print("[persistence] Restored panel settings from MongoDB.", flush=True)
+        _DB_CACHE.clear()
+    except Exception as e:
+        print(f"[persistence] boot restore failed: {e}", flush=True)
 
 if not TOKEN:
     sys.exit(
@@ -1056,29 +1139,52 @@ def bullet(label: str, value: Any, glyph: str = G["bullet"]) -> str:
 # ═════════════════════════════════════════════════════════════════
 
 _db_lock = threading.RLock()
+_ATOMIC_WRITE_LOCK = threading.RLock()
 
 
 def _atomic_write(path: Path, data: Any) -> None:
-    """Write JSON atomically. Falls back to copy+rename if `replace` fails
-    across filesystem boundaries (some Docker volume setups)."""
+    """Crash-safe, thread-safe JSON write.
+
+    The old implementation used one shared ``*.tmp`` filename. Two TeleBot
+    worker threads could overwrite/unlink that same temp file, producing the
+    exact ``panel_db.json.tmp -> panel_db.json`` FileNotFoundError seen in the
+    production log. A unique temp file plus a process-wide lock eliminates that
+    race. A small ``.bak`` is also kept for recovery from interrupted writes.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(data, indent=2, default=str, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    try:
-        tmp.replace(path)
-    except OSError:
-        # Cross-device or permission issue — fall back to copy+unlink
+    payload = json.dumps(data, indent=2, default=str, ensure_ascii=False).encode("utf-8")
+    with _ATOMIC_WRITE_LOCK:
+        tmp = None
         try:
-            shutil.copyfile(str(tmp), str(path))
-            tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
-        except TypeError:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=f".{os.getpid()}.{threading.get_ident()}.tmp",
+                dir=str(path.parent),
+            )
+            tmp = Path(tmp_name)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if path.exists():
+                try:
+                    shutil.copy2(str(path), str(path.with_suffix(path.suffix + ".bak")))
+                except Exception:
+                    pass
+            os.replace(str(tmp), str(path))
             try:
-                tmp.unlink()
-            except FileNotFoundError:
+                dfd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except Exception:
                 pass
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -1087,9 +1193,18 @@ def _load_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        # corrupt — keep a copy and reset
+        # Recover from the last known-good sidecar before giving up.
+        bak = path.with_suffix(path.suffix + ".bak")
         try:
-            path.replace(path.with_suffix(".corrupt"))
+            if bak.exists():
+                recovered = json.loads(bak.read_text(encoding="utf-8"))
+                if recovered is not None:
+                    print(f"[persistence] recovered {path.name} from backup", flush=True)
+                    return recovered
+        except Exception:
+            pass
+        try:
+            path.replace(path.with_suffix(path.suffix + ".corrupt"))
         except Exception:
             pass
         return default
@@ -1274,6 +1389,8 @@ def db_save(d: Dict[str, Any]) -> None:
         protected = _encrypt_db_copy(d)
         _atomic_write(DB_FILE, protected)
         _cache_invalidate(DB_FILE)
+        # Durable remote mirror for redeploy/rebuild recovery.
+        _mongo_put("db", protected)
 
 
 def settings_load() -> Dict[str, Any]:
@@ -1291,8 +1408,10 @@ def settings_load_ro() -> Dict[str, Any]:
 
 def settings_save(d: Dict[str, Any]) -> None:
     with _db_lock:
-        _atomic_write(SETTINGS_FILE, _encrypt_settings_copy(d))
+        protected = _encrypt_settings_copy(d)
+        _atomic_write(SETTINGS_FILE, protected)
         _cache_invalidate(SETTINGS_FILE)
+        _mongo_put("settings", protected)
 
 
 def _secure_storage_migrate() -> None:
@@ -4374,8 +4493,10 @@ def save_bot(doc: Dict[str, Any]) -> Dict[str, Any]:
     # We already hold _db_lock; write directly to avoid releasing the lock
     # between the read and write. This prevents concurrent status updates from
     # losing a deletion or another bot's update.
-    _atomic_write(DB_FILE, _encrypt_db_copy(d))
+    protected_db = _encrypt_db_copy(d)
+    _atomic_write(DB_FILE, protected_db)
     _cache_invalidate(DB_FILE)
+    _mongo_put("db", protected_db)
     try:
         _write_env_sidecar(bid, authoritative_env)
     except Exception:
@@ -4411,8 +4532,10 @@ def delete_bot_doc(bot_id: str) -> None:
         d = _cached_load(DB_FILE, {})
         d = _ensure_db_defaults(copy.deepcopy(d))
         d["bots"].pop(str(bot_id), None)
-        _atomic_write(DB_FILE, _encrypt_db_copy(d))
+        protected_db = _encrypt_db_copy(d)
+        _atomic_write(DB_FILE, protected_db)
         _cache_invalidate(DB_FILE)
+        _mongo_put("db", protected_db)
     # Remove local metadata/ENV. Source files are intentionally left alone for
     # the existing "Delete Record" semantics; Delete Everything removes them.
     try:
@@ -15180,8 +15303,10 @@ def on_document(m: types.Message) -> None:
             f = bot.get_file(doc.file_id)
             raw = bot.download_file(f.file_path)
             import json as _json2
-            _json2.loads(raw)
-            DB_FILE.write_bytes(raw)
+            imported = _json2.loads(raw)
+            _atomic_write(DB_FILE, imported)
+            _cache_invalidate(DB_FILE)
+            _mongo_put("db", imported)
             audit(uid, "import_db", f"size={len(raw)}")
             USER_STATES.pop(uid, None)
             bot.reply_to(m, f"{G['ok']} DB imported. Restart bot to apply.")
@@ -15747,6 +15872,9 @@ def main() -> int:
         ANNOUNCE_CHANNEL = ac
     gh_load_config()
     GH["autoEnabled"] = bool(get_setting("github_auto_enabled", True))
+    # Recover the master state before any other boot-time restoration logic.
+    _durable_restore_on_boot()
+    cache_clear_all()
     try:
         set_setting("payment_currency", "INR")
         set_setting("currency_symbol", "₹")

@@ -9,3 +9,5 @@ Pillow
 curl_cffi
 
 qrcode
+
+pymongo
