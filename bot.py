@@ -3180,38 +3180,47 @@ _PIP_BASE_FLAGS = ["--upgrade", "--no-input", "--no-warn-script-location",
 
 
 def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
-    """Ensure Kurigram owns the ``pyrogram`` import namespace.
+    """Prepare an isolated Kurigram namespace for bots that need it.
 
-    Kurigram is intentionally imported as ``pyrogram``. A previously cached
-    standard Pyrogram install inside a bot's .deps directory can therefore
-    shadow Kurigram and produce errors such as ``ButtonStyle`` missing.
-    Remove only the conflicting standard-Pyrogram files before installing
-    Kurigram; leave all unrelated bot dependencies untouched.
+    Kurigram intentionally exposes the ``pyrogram`` import namespace. A
+    standard Pyrogram package can remain in a long-lived bot ``.deps`` cache
+    even after a requirements update, and then Python imports the wrong
+    implementation. We therefore remove the conflicting namespace from the
+    normal cache and also use a dedicated ``.kurigram`` target, which is put
+    *before* ``.deps`` on the child PYTHONPATH.
     """
     deps_dir = bot_dir / ".deps"
-    if not deps_dir.exists():
-        return
+    kurigram_dir = bot_dir / ".kurigram"
     removed = False
     try:
-        py_pkg = deps_dir / "pyrogram"
-        if py_pkg.exists():
-            shutil.rmtree(str(py_pkg), ignore_errors=True)
-            removed = True
-        for child in list(deps_dir.iterdir()):
-            low = child.name.lower()
-            if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
-                if child.is_dir():
-                    shutil.rmtree(str(child), ignore_errors=True)
-                else:
-                    try:
-                        child.unlink()
-                    except Exception:
-                        pass
+        # Clean the normal dependency cache only for the conflicting
+        # pyrogram namespace. Do not disturb unrelated bot packages.
+        if deps_dir.exists():
+            py_pkg = deps_dir / "pyrogram"
+            if py_pkg.exists():
+                shutil.rmtree(str(py_pkg), ignore_errors=True)
                 removed = True
+            for child in list(deps_dir.iterdir()):
+                low = child.name.lower()
+                if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
+                    if child.is_dir():
+                        shutil.rmtree(str(child), ignore_errors=True)
+                    else:
+                        try:
+                            child.unlink()
+                        except Exception:
+                            pass
+                    removed = True
+        # Always rebuild the small dedicated provider directory. This makes
+        # the result deterministic even if pip previously left a conflicting
+        # package in the shared --target directory.
+        if kurigram_dir.exists():
+            shutil.rmtree(str(kurigram_dir), ignore_errors=True)
+        kurigram_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         log.append(f"[{G['warn']}] Kurigram cache cleanup warning: {e}")
     if removed:
-        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; Kurigram will be installed for this bot")
+        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; using isolated Kurigram namespace")
 
 
 def _needs_kurigram(bot_dir: Path) -> bool:
@@ -3273,10 +3282,11 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             # package from winning the shared ``pyrogram`` namespace.
             if _needs_kurigram(bot_dir):
                 _prepare_kurigram_deps(bot_dir, log)
-                log.append(f"{G['div']} enforcing Kurigram for pyrogram namespace {G['div']}")
+                kurigram_dir = bot_dir / ".kurigram"
+                log.append(f"{G['div']} enforcing isolated Kurigram for pyrogram namespace {G['div']}")
                 rk = subprocess.run(
                     [sys.executable, "-m", "pip", "install",
-                     "--target", str(deps_dir), *_PIP_BASE_FLAGS,
+                     "--target", str(kurigram_dir), *_PIP_BASE_FLAGS,
                      "--force-reinstall", "kurigram>=2.2.25"],
                     cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
                     env=pip_env,
@@ -3548,7 +3558,12 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     # Keep both the project root and the entry file's directory importable.
     # This is important for ZIPs such as MyBot/main.py + database.py.
     entry_parent = (bot_dir / entry).parent
-    pp_parts = [str(bot_dir), str(entry_parent), str(bot_dir / ".deps")]
+    # Kurigram must come before the normal .deps cache because both Kurigram
+    # and standard Pyrogram expose the same ``pyrogram`` import namespace.
+    pp_parts = [str(bot_dir), str(entry_parent)]
+    if _needs_kurigram(bot_dir):
+        pp_parts.append(str(bot_dir / ".kurigram"))
+    pp_parts.append(str(bot_dir / ".deps"))
     existing_pp = run_env.get("PYTHONPATH", "")
     if existing_pp:
         pp_parts.append(existing_pp)
