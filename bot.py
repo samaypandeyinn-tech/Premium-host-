@@ -3179,6 +3179,64 @@ _PIP_BASE_FLAGS = ["--upgrade", "--no-input", "--no-warn-script-location",
                    "--disable-pip-version-check"]
 
 
+def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
+    """Ensure Kurigram owns the ``pyrogram`` import namespace.
+
+    Kurigram is intentionally imported as ``pyrogram``. A previously cached
+    standard Pyrogram install inside a bot's .deps directory can therefore
+    shadow Kurigram and produce errors such as ``ButtonStyle`` missing.
+    Remove only the conflicting standard-Pyrogram files before installing
+    Kurigram; leave all unrelated bot dependencies untouched.
+    """
+    deps_dir = bot_dir / ".deps"
+    if not deps_dir.exists():
+        return
+    removed = False
+    try:
+        py_pkg = deps_dir / "pyrogram"
+        if py_pkg.exists():
+            shutil.rmtree(str(py_pkg), ignore_errors=True)
+            removed = True
+        for child in list(deps_dir.iterdir()):
+            low = child.name.lower()
+            if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
+                if child.is_dir():
+                    shutil.rmtree(str(child), ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except Exception:
+                        pass
+                removed = True
+    except Exception as e:
+        log.append(f"[{G['warn']}] Kurigram cache cleanup warning: {e}")
+    if removed:
+        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; Kurigram will be installed for this bot")
+
+
+def _needs_kurigram(bot_dir: Path) -> bool:
+    """Return True for projects using Kurigram-only Pyrogram APIs."""
+    try:
+        for pyfile in bot_dir.rglob("*.py"):
+            if ".deps" in pyfile.parts:
+                continue
+            text = pyfile.read_text(errors="ignore")
+            if "ButtonStyle" in text or "max_concurrent_transmissions" in text:
+                return True
+    except Exception:
+        pass
+    try:
+        req = bot_dir / "requirements.txt"
+        if req.exists():
+            for raw in req.read_text(errors="ignore").splitlines():
+                line = raw.strip().lower()
+                if line and not line.startswith("#") and re.match(r"^kurigram(?:[<>=!~]|$)", line):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
     try:
         if kind == "python":
@@ -3186,6 +3244,13 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             deps_dir.mkdir(parents=True, exist_ok=True)
             req = bot_dir / "requirements.txt"
             pip_env = _pip_env(deps_dir)
+
+            # Kurigram intentionally provides the ``pyrogram`` namespace.
+            # Remove a stale/conflicting standard Pyrogram cache before any
+            # requirements or AST-scan installation can leave it in front of
+            # Kurigram. This is especially important on long-lived panels.
+            if _needs_kurigram(bot_dir):
+                _prepare_kurigram_deps(bot_dir, log)
 
             # 1) requirements.txt (if present)
             if req.exists():
@@ -3202,6 +3267,25 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
                 for line in (r.stderr or "").splitlines()[-10:]:
                     log.append(line)
                 log.append(f"[{G['ok']}] requirements.txt done (rc={r.returncode})")
+
+            # If this is a Kurigram/AloneX project, explicitly install the
+            # provider after requirements. This prevents a stale Pyrogram
+            # package from winning the shared ``pyrogram`` namespace.
+            if _needs_kurigram(bot_dir):
+                _prepare_kurigram_deps(bot_dir, log)
+                log.append(f"{G['div']} enforcing Kurigram for pyrogram namespace {G['div']}")
+                rk = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "--target", str(deps_dir), *_PIP_BASE_FLAGS,
+                     "--force-reinstall", "kurigram>=2.2.25"],
+                    cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
+                    env=pip_env,
+                )
+                for line in (rk.stdout or "").splitlines()[-10:]:
+                    log.append(line)
+                for line in (rk.stderr or "").splitlines()[-10:]:
+                    log.append(line)
+                log.append(f"[{G['ok'] if rk.returncode == 0 else G['warn']}] Kurigram enforcement done (rc={rk.returncode})")
 
             # 2) AST-scan imports and install anything still missing.
             #    We always do this so a bot that adds a new `import foo`
