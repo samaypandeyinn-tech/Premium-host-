@@ -653,6 +653,9 @@ _PANEL_MONGO_DB = (_HOST_SECRET_ENV.get("PANEL_MONGO_DB") or "kryon_host").strip
 _MONGO_CLIENT = None
 _MONGO_DB = None
 _MONGO_LOCK = threading.RLock()
+_PANEL_LOCK_OWNER = secrets.token_hex(16)
+_PANEL_LOCK_TTL = 90
+_PANEL_LOCK_HEARTBEAT_STOP = threading.Event()
 
 def _mongo_db():
     global _MONGO_CLIENT, _MONGO_DB
@@ -701,6 +704,71 @@ def _mongo_put(kind: str, data: Any) -> bool:
     except Exception as e:
         print(f"[persistence] Mongo write failed ({kind}): {e}", flush=True)
         return False
+
+def _acquire_distributed_panel_lock() -> bool:
+    """Acquire a Mongo-backed lease so only one panel replica polls Telegram.
+
+    A filesystem lock only protects against duplicate processes sharing one
+    container. Platforms that restart/scale containers can otherwise run two
+    replicas against the same bot token, producing Telegram 409 conflicts and
+    concurrent whole-DB writes. The lease expires automatically if a replica
+    dies.
+    """
+    db = _mongo_db()
+    if db is None:
+        return True  # local-only deployments keep the existing file lock
+    try:
+        from pymongo import ReturnDocument
+        now = time.time()
+        doc = db.panel_state.find_one_and_update(
+            {"_id": "panel_runtime_lock",
+             "$or": [{"owner": _PANEL_LOCK_OWNER}, {"expires_at": {"$lt": now}}]},
+            {"$set": {"owner": _PANEL_LOCK_OWNER,
+                      "expires_at": now + _PANEL_LOCK_TTL,
+                      "updated_at": now}},
+            upsert=False, return_document=ReturnDocument.AFTER,
+        )
+        if doc and doc.get("owner") == _PANEL_LOCK_OWNER:
+            return True
+        # First owner creation. A unique _id makes simultaneous creation safe.
+        try:
+            db.panel_state.insert_one({"_id": "panel_runtime_lock",
+                                       "owner": _PANEL_LOCK_OWNER,
+                                       "expires_at": now + _PANEL_LOCK_TTL,
+                                       "updated_at": now})
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        print(f"[persistence] distributed panel lock failed: {e}", flush=True)
+        # Do not silently create multiple pollers when Mongo is configured but
+        # unavailable. The local instance can still serve as a safe fallback.
+        return False
+
+def _panel_lock_heartbeat() -> None:
+    while not _PANEL_LOCK_HEARTBEAT_STOP.wait(30):
+        db = _mongo_db()
+        if db is None:
+            continue
+        try:
+            db.panel_state.update_one(
+                {"_id": "panel_runtime_lock", "owner": _PANEL_LOCK_OWNER},
+                {"$set": {"expires_at": time.time() + _PANEL_LOCK_TTL,
+                          "updated_at": time.time()}},
+            )
+        except Exception as e:
+            print(f"[persistence] panel lock heartbeat failed: {e}", flush=True)
+
+def _release_distributed_panel_lock() -> None:
+    _PANEL_LOCK_HEARTBEAT_STOP.set()
+    db = _mongo_db()
+    if db is None:
+        return
+    try:
+        db.panel_state.delete_one({"_id": "panel_runtime_lock", "owner": _PANEL_LOCK_OWNER})
+    except Exception:
+        pass
+
 
 def _durable_restore_on_boot() -> None:
     """Recover local state from Mongo only when the local copy is absent/empty."""
@@ -1384,6 +1452,32 @@ def db_load_ro() -> Dict[str, Any]:
 
 def db_save(d: Dict[str, Any]) -> None:
     with _db_lock:
+        # Merge bot records against the newest on-disk snapshot before saving.
+        # A normal handler does db_load() -> mutate -> db_save(); if two users
+        # do that concurrently, the second handler may hold a stale snapshot
+        # and previously could erase the first user's newly-added bot. Missing
+        # bot IDs are therefore preserved unless a persistent tombstone says
+        # that deletion was intentional. All normal deletes go through
+        # delete_bot_doc(), which creates that tombstone first.
+        try:
+            current = _ensure_db_defaults(copy.deepcopy(_cached_load(DB_FILE, {})))
+            incoming = copy.deepcopy(d)
+            current_bots = current.get("bots", {}) or {}
+            incoming_bots = incoming.get("bots", {}) or {}
+            deleted_ids = _deleted_bot_ids()
+            merged_bots = dict(current_bots)
+            for bid, doc in incoming_bots.items():
+                if str(bid) not in deleted_ids:
+                    merged_bots[str(bid)] = doc
+            for bid in list(merged_bots.keys()):
+                if str(bid) in deleted_ids:
+                    merged_bots.pop(bid, None)
+            incoming["bots"] = merged_bots
+            d = incoming
+        except Exception:
+            # Never block a save because the merge helper failed; the atomic
+            # writer below still guarantees a valid JSON snapshot.
+            pass
         # Encrypt child ENV values on disk; keep the caller's in-memory copy
         # unchanged so runtime code can use normal strings.
         protected = _encrypt_db_copy(d)
@@ -2491,7 +2585,69 @@ RUNNING: Dict[str, Dict[str, Any]] = {}    # bot_id -> {proc, kind, started, log
 START_TIME: float = time.time()            # panel boot time, for uptime card
 _LOCK_FH_KEEPALIVE: Any = None             # singleton-lock fd, kept alive for the process lifetime
 _runner_lock = threading.Lock()
+# Limit concurrent dependency installations.  pip/npm are CPU + RAM hungry;
+# allowing every user's first start to install at once can OOM the panel even
+# when the child bots themselves are within their plan limits.
+_INSTALL_SEMAPHORE = threading.BoundedSemaphore(2)
 SECURE_EXEC = BASE_DIR / "secure_exec.py"
+
+# Host-wide child resource admission control.  Per-bot RAM limits alone are
+# insufficient: e.g. 20 users can each start a 512 MB bot on a 2 GB host and
+# the Linux OOM killer may terminate the panel itself.  We reserve the plan
+# limit before spawning a child and keep a safety margin for the panel/OS.
+_CHILD_RAM_BUDGET_RATIO = 0.70
+_CHILD_RAM_MIN_RESERVE_MB = 96
+_CHILD_MAX_RUNNING_DEFAULT = 0
+
+def _host_child_ram_budget_mb() -> int:
+    if psutil is None:
+        return 0
+    try:
+        total_mb = int(psutil.virtual_memory().total // (1024 * 1024))
+        return max(128, int(total_mb * _CHILD_RAM_BUDGET_RATIO))
+    except Exception:
+        return 0
+
+def _running_child_ram_reservation_mb() -> int:
+    total = 0
+    if psutil is None:
+        return 0
+    for bid, info in list(RUNNING.items()):
+        try:
+            proc = info.get("proc")
+            if not proc or proc.poll() is not None:
+                continue
+            total += max(_CHILD_RAM_MIN_RESERVE_MB, int(info.get("ram_limit_mb", 0) or 0))
+        except Exception:
+            continue
+    return total
+
+def _resource_admission_check(owner_doc: Dict[str, Any], requested_ram_mb: int) -> Tuple[bool, str]:
+    """Refuse a new child when its *reserved* RAM would exceed host capacity.
+
+    This is intentionally an admission check rather than a late kill: the
+    safest way to keep the hosting panel alive is to never create an
+    impossible set of child processes in the first place.
+    """
+    if psutil is None:
+        return True, ""
+    requested = max(_CHILD_RAM_MIN_RESERVE_MB, int(requested_ram_mb or 0))
+    budget = _host_child_ram_budget_mb()
+    if budget <= 0:
+        return True, ""
+    with _runner_lock:
+        reserved = _running_child_ram_reservation_mb()
+        running_count = sum(1 for x in RUNNING.values()
+                            if x.get("proc") and x["proc"].poll() is None)
+    max_running = int(os.environ.get("PANEL_MAX_RUNNING_BOTS", str(_CHILD_MAX_RUNNING_DEFAULT)) or 0)
+    if max_running > 0 and running_count >= max_running:
+        return False, f"Host capacity reached ({max_running} bots running). Try again later."
+    if reserved + requested > budget:
+        available = max(0, budget - reserved)
+        return False, (f"Host RAM capacity is protected: need {requested} MB, "
+                       f"only about {available} MB is currently reservable. "
+                       "Stop another bot or upgrade/move to a larger host.")
+    return True, ""
 
 
 _SKIP_DIR_PARTS = {".deps", "node_modules", ".tmp_run", "__pycache__",
@@ -3242,9 +3398,25 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "No entry file (index.js / bot.py)."}
 
     log: List[str] = [f"{G['div_eq']} START {ts_iso()} {G['div_eq']}"]
+    # Reserve the owner's per-bot RAM *before* spawning. This prevents a
+    # collection of otherwise-valid heavy bots from exhausting the host.
+    try:
+        plan_key = str(owner_doc.get("plan", "free") or "free")
+        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
+    except Exception:
+        ram_mb = 128
+    allowed, reason = _resource_admission_check(owner_doc, ram_mb)
+    if not allowed:
+        log.append(f"[{G['warn']}] {reason}")
+        return {"ok": False, "error": reason}
+
+    # Dependency installation is serialized/limited so simultaneous uploads
+    # from many users cannot create a pip/npm memory spike that kills the
+    # panel. Waiting users remain queued instead of spawning installers.
+    with _INSTALL_SEMAPHORE:
+        install_deps(bot_dir, kind, log)
     if b.get("status") != "running":
         b.pop("_restart_history", None)
-    install_deps(bot_dir, kind, log)
     # Run every untrusted child through secure_exec.py. It disables core
     # dumps/ptrace visibility (PR_SET_DUMPABLE=0 where supported) before
     # exec'ing the real bot, reducing cross-process credential exposure.
@@ -3277,6 +3449,18 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     if existing_pp:
         pp_parts.append(existing_pp)
     run_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pp_parts))
+    # Reserve the owner's per-bot RAM *before* spawning. This prevents a
+    # collection of otherwise-valid heavy bots from exhausting the host.
+    try:
+        plan_key = str(owner_doc.get("plan", "free") or "free")
+        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
+    except Exception:
+        ram_mb = 128
+    allowed, reason = _resource_admission_check(owner_doc, ram_mb)
+    if not allowed:
+        log.append(f"[{G['warn']}] {reason}")
+        return {"ok": False, "error": reason}
+
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(bot_dir), env=run_env,
@@ -3290,6 +3474,7 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
         "proc": proc, "kind": kind, "started": time.time() * 1000,
         "log": log, "dir": str(bot_dir), "name": b["name"],
         "owner": b["owner"], "manual_stop": False,
+        "ram_limit_mb": ram_mb,
     }
     with _runner_lock:
         RUNNING[bid] = info
@@ -3297,8 +3482,6 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
 
     # Enforce the RAM allowance attached to the owner's active plan.
     try:
-        plan_key = str(owner_doc.get("plan", "free") or "free")
-        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
         if psutil is not None and ram_mb > 0:
             threading.Thread(
                 target=_watch_child_memory, args=(bid, proc.pid, ram_mb), daemon=True,
@@ -6461,8 +6644,7 @@ def action_adm_gh_run_file(call: types.CallbackQuery, repo: str, path: str) -> N
                 "source":       f"github:{repo}/{path}",
                 "last_exit_code": None,
             }
-            d_db["bots"][bid] = new_bot
-            db_save(d_db)
+            save_bot(new_bot)
             audit(owner, "gh_run_file", f"repo={repo} path={path} bid={bid}")
             # Start the bot
             result = start_child(new_bot)
@@ -8753,11 +8935,10 @@ def reject_bot(bot_id: str, admin_uid: int, reason: str = "") -> Dict[str, Any]:
         rmrf(b.get("dir", ""))
     except Exception:
         pass
-    # Remove the bot entry so the user's slot frees up
+    # Remove the bot entry atomically and create a tombstone so a stale
+    # handler/worker cannot reinsert it.
     try:
-        db = db_load()
-        db["bots"].pop(bot_id, None)
-        db_save(db)
+        delete_bot_doc(bot_id)
     except Exception:
         pass
     audit(admin_uid, "reject_bot", f"bot={bot_id} reason={reason}")
@@ -9617,7 +9798,7 @@ def _plan_enforce_bot_limit(uid):
     u = d["users"].get(str(uid), {})
     plan   = u.get("plan", "free") or "free"
     limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
-    max_b  = limits.get("bots", 1)
+    max_b  = int(limits.get("max_bots", 1) or 1)
     if max_b == -1:
         return True, ""
     cur = sum(1 for b in d["bots"].values() if str(b.get("owner")) == str(uid))
@@ -11703,8 +11884,7 @@ def _action_gh_file_run(call: types.CallbackQuery, path: str) -> None:
                 "source": "github_browser", "gh_path": path, "entry": fname,
             }
             d = db_load()
-            d["bots"][bot_id] = doc
-            db_save(d)
+            save_bot(doc)
             audit(uid, "gh_browser_run", f"path={path} bot_id={bot_id}")
             res = start_child(doc)
             bot.send_message(uid,
@@ -12979,9 +13159,7 @@ def action_bot_clone(call: types.CallbackQuery, bot_id: str) -> None:
         "created": ts_iso(), "status": "stopped",
     })
     new_doc.pop("last_started", None)
-    d = db_load()
-    d["bots"][new_id] = new_doc
-    db_save(d)
+    save_bot(new_doc)
     audit(uid, "bot_clone", f"src={bot_id} new={new_id}")
     bot.send_message(uid,
         f"<b>{G['ok']} {sc('Bot cloned')}</b>\n{bullet('New Bot ID', new_id)}\n{bullet('Name', new_doc['name'])}",
@@ -15490,9 +15668,7 @@ def on_text(m: types.Message) -> None:
                     "enc_files": {}, "env": {}, "status": "stopped", "cron": {},
                     "source": "github", "gh_repo": repo_url, "entry": entry,
                 }
-                d3 = db_load()
-                d3["bots"][bot_id] = doc
-                db_save(d3)
+                save_bot(doc)
                 audit(uid, "gh_repo_clone", f"repo={repo_url} bot_id={bot_id}")
                 try:
                     bot.send_message(uid,
@@ -15664,7 +15840,9 @@ def on_text(m: types.Message) -> None:
                 if str(b.get("owner")) == target_uid_str:
                     try: stop_child(b["_id"])
                     except Exception: pass
-                    d["bots"].pop(b["_id"], None)
+                    try: delete_bot_doc(b["_id"])
+                    except Exception: pass
+            d = db_load()
             d["users"][target_uid_str]["plan"] = "free"
             d["users"][target_uid_str]["plan_expires"] = None
             d["users"][target_uid_str]["wallet"] = 0
@@ -15860,7 +16038,11 @@ def banner() -> None:
 
 def main() -> int:
     banner()
-    global OWNER_ID, BRAND_TAG, ANNOUNCE_CHANNEL
+    global OWNER_ID, BRAND_TAG, ANNOUNCE_CHANNEL, _LOCK_FH_KEEPALIVE
+    # Local singleton guard + Mongo distributed lease together cover both
+    # duplicate processes in one container and duplicate replicas on hosts
+    # that scale/redeploy services.
+    _LOCK_FH_KEEPALIVE = _acquire_singleton_lock()
     stored_owner = int(get_setting("owner_id", 0) or 0)
     if stored_owner > 0 and OWNER_ID <= 0:
         OWNER_ID = stored_owner
@@ -15874,6 +16056,13 @@ def main() -> int:
     GH["autoEnabled"] = bool(get_setting("github_auto_enabled", True))
     # Recover the master state before any other boot-time restoration logic.
     _durable_restore_on_boot()
+    # On multi-replica hosts, only one instance may poll the Telegram token.
+    # Otherwise Telegram returns 409 and both instances can race whole-DB
+    # persistence, making recently deployed bots appear to disappear.
+    if not _acquire_distributed_panel_lock():
+        return 2
+    threading.Thread(target=_panel_lock_heartbeat, daemon=True,
+                     name="panel-mongo-lock-heartbeat").start()
     cache_clear_all()
     try:
         set_setting("payment_currency", "INR")

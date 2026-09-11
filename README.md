@@ -27,3 +27,13 @@ BharatPe verification is optional. When configured and Auto-Approve is enabled, 
 - Child output is redacted for common Telegram tokens, API keys, passwords and database URLs.
 
 This protects credentials at rest and isolates the host environment as far as a single-host subprocess architecture permits. Fully hostile third-party code requires OS/container isolation for a hard security boundary.
+
+## Stability / isolation fixes
+
+- Panel persistence uses the dedicated `kryon_host` MongoDB database by default. Child bots may use their own MongoDB databases (for example `Anon`) without sharing panel collections.
+- A Mongo-backed runtime lease prevents multiple panel replicas from polling the same Telegram token at once.
+- Bot records are merged against the newest DB snapshot before save, preventing concurrent user deployments from erasing other users' bot records.
+- Child RAM is reserved before startup against a host-wide safety budget; if the host cannot safely fit another bot, the panel rejects that start instead of risking an OOM crash.
+- Dependency installation is limited to two concurrent installers to reduce pip/npm CPU/RAM spikes during mass deployments.
+- Existing per-bot RAM enforcement remains enabled.
+
