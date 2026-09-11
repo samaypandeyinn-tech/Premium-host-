@@ -392,7 +392,7 @@ try:
     _SCANNER_OK = True
 except Exception as _ssf_err:
     import sys as _sys
-    print(f"[security] security_scanner_free.py not found — using built-in scanner ({_ssf_err})", file=_sys.stderr)
+    print(f"[security] optional security_scanner_free.py unavailable — using built-in scanner ({_ssf_err})", flush=True)
     # Fall back to built-in _scan_file defined above
 
 
@@ -16059,8 +16059,13 @@ def main() -> int:
     # On multi-replica hosts, only one instance may poll the Telegram token.
     # Otherwise Telegram returns 409 and both instances can race whole-DB
     # persistence, making recently deployed bots appear to disappear.
-    if not _acquire_distributed_panel_lock():
-        return 2
+    # Never exit just because another replica currently owns the Telegram
+    # lease. Container hosts commonly restart exited processes, which would
+    # create a tight restart loop. Wait here until the lease is available.
+    while not _acquire_distributed_panel_lock():
+        print("[persistence] Telegram lease is currently owned by another panel instance; waiting...", flush=True)
+        time.sleep(10)
+    print("[persistence] Telegram panel lease acquired.", flush=True)
     threading.Thread(target=_panel_lock_heartbeat, daemon=True,
                      name="panel-mongo-lock-heartbeat").start()
     cache_clear_all()
