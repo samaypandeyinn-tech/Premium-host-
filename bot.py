@@ -2952,7 +2952,9 @@ _PYPI_ALIAS: Dict[str, str] = {
     # the installed copy in `_filter_third_party`.
     "telegram":      "python-telegram-bot",
     "telethon":      "Telethon",
-    "pyrogram":      "Pyrogram",
+    # AloneX/Kurigram projects import the `pyrogram` compatibility module.
+    # Do not install the unrelated Pyrogram distribution over Kurigram.
+    "pyrogram":      "kurigram",
     "hydrogram":     "hydrogram",
     "pyromod":       "pyromod",
     "tgcrypto":      "TgCrypto",
@@ -2986,6 +2988,9 @@ _PYPI_ALIAS: Dict[str, str] = {
     "starlette":     "starlette",
     "redis":         "redis",
     "pymongo":       "pymongo",
+    # Common import-name mismatches used by music bots.
+    "pytgcalls":     "py-tgcalls",
+    "py_yt":         "py-yt-search",
     "motor":         "motor",
     "psutil":        "psutil",
     "schedule":      "schedule",
@@ -3103,26 +3108,41 @@ def _filter_third_party(modules: List[str], bot_dir: Path) -> List[str]:
             # things like cv2 already installed in .deps/).
             try:
                 if _ilu.find_spec(m) is not None:
-                    # Even if importable, validate that the installed
-                    # copy is the RIGHT package (not the wrong-name
-                    # PyPI shim). If it isn't, nuke it so pip can
-                    # reinstall the correct one below.
-                    needed = _VALIDATE_SYMBOLS.get(m)
-                    if needed:
+                    # Kurigram intentionally exposes the `pyrogram` import
+                    # namespace. A host may already have the old Pyrogram
+                    # package installed globally, so merely finding
+                    # `pyrogram` is NOT enough for AloneX/Kurigram bots.
+                    # Detect the Kurigram-only API used by these bots and
+                    # install Kurigram into the bot's isolated .deps when
+                    # the global copy is the wrong implementation.
+                    if m == "pyrogram":
                         try:
                             _real = importlib.import_module(m)
-                            if all(hasattr(_real, s) for s in needed):
+                            _enums = getattr(_real, "enums", None)
+                            if _enums is not None and hasattr(_enums, "ButtonStyle"):
                                 continue
                         except Exception:
                             pass
-                        # Wrong package — purge and force a reinstall.
-                        try:
-                            del sys.modules[m]
-                        except KeyError:
-                            pass
-                        _purge_bad_install(deps_dir, m)
                     else:
-                        continue
+                        # Even if importable, validate that the installed
+                        # copy is the RIGHT package (not the wrong-name
+                        # PyPI shim). If it isn't, nuke it so pip can
+                        # reinstall the correct one below.
+                        needed = _VALIDATE_SYMBOLS.get(m)
+                        if needed:
+                            try:
+                                _real = importlib.import_module(m)
+                                if all(hasattr(_real, s) for s in needed):
+                                    continue
+                            except Exception:
+                                pass
+                            try:
+                                del sys.modules[m]
+                            except KeyError:
+                                pass
+                            _purge_bad_install(deps_dir, m)
+                        else:
+                            continue
             except (ImportError, ValueError):
                 pass
             pip_name = _PYPI_ALIAS.get(m, m)
