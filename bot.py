@@ -3180,55 +3180,55 @@ _PIP_BASE_FLAGS = ["--upgrade", "--no-input", "--no-warn-script-location",
                    "--disable-pip-version-check"]
 
 
-def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
-    """Prepare an isolated Kurigram namespace for bots that need it.
+def _kurigram_ready(bot_dir: Path) -> bool:
+    """Return True when the bot's isolated dependency cache has Kurigram."""
+    try:
+        enums_py = bot_dir / ".deps" / "pyrogram" / "enums.py"
+        if not enums_py.is_file():
+            return False
+        return "ButtonStyle" in enums_py.read_text(errors="ignore")
+    except Exception:
+        return False
 
-    Kurigram intentionally exposes the ``pyrogram`` import namespace. A
-    standard Pyrogram package can remain in a long-lived bot ``.deps`` cache
-    even after a requirements update, and then Python imports the wrong
-    implementation. We therefore remove the conflicting namespace from the
-    normal cache and also use a dedicated ``.kurigram`` target, which is put
-    *before* ``.deps`` on the child PYTHONPATH.
+
+def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
+    """Remove only conflicting standard-Pyrogram files from this bot cache.
+
+    Kurigram deliberately uses the ``pyrogram`` import namespace. Keeping the
+    two distributions in the same per-bot target is unsafe because whichever
+    files were installed last can win. We therefore clean only that namespace
+    and leave every unrelated dependency untouched.
     """
     deps_dir = bot_dir / ".deps"
-    kurigram_dir = bot_dir / ".kurigram"
+    deps_dir.mkdir(parents=True, exist_ok=True)
     removed = False
     try:
-        # Clean the normal dependency cache only for the conflicting
-        # pyrogram namespace. Do not disturb unrelated bot packages.
-        if deps_dir.exists():
-            py_pkg = deps_dir / "pyrogram"
-            if py_pkg.exists():
-                shutil.rmtree(str(py_pkg), ignore_errors=True)
+        py_pkg = deps_dir / "pyrogram"
+        if py_pkg.exists():
+            shutil.rmtree(str(py_pkg), ignore_errors=True)
+            removed = True
+        for child in list(deps_dir.iterdir()):
+            low = child.name.lower()
+            if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
+                if child.is_dir():
+                    shutil.rmtree(str(child), ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except Exception:
+                        pass
                 removed = True
-            for child in list(deps_dir.iterdir()):
-                low = child.name.lower()
-                if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
-                    if child.is_dir():
-                        shutil.rmtree(str(child), ignore_errors=True)
-                    else:
-                        try:
-                            child.unlink()
-                        except Exception:
-                            pass
-                    removed = True
-        # Always rebuild the small dedicated provider directory. This makes
-        # the result deterministic even if pip previously left a conflicting
-        # package in the shared --target directory.
-        if kurigram_dir.exists():
-            shutil.rmtree(str(kurigram_dir), ignore_errors=True)
-        kurigram_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         log.append(f"[{G['warn']}] Kurigram cache cleanup warning: {e}")
     if removed:
-        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; using isolated Kurigram namespace")
+        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; installing Kurigram in .deps")
 
 
 def _needs_kurigram(bot_dir: Path) -> bool:
-    """Return True for projects using Kurigram-only Pyrogram APIs."""
+    """Detect projects that require Kurigram-only Pyrogram APIs."""
     try:
         for pyfile in bot_dir.rglob("*.py"):
-            if ".deps" in pyfile.parts:
+            if ".deps" in pyfile.parts or "__pycache__" in pyfile.parts:
                 continue
             text = pyfile.read_text(errors="ignore")
             if "ButtonStyle" in text or "max_concurrent_transmissions" in text:
@@ -3247,6 +3247,19 @@ def _needs_kurigram(bot_dir: Path) -> bool:
     return False
 
 
+def _dependency_fingerprint(bot_dir: Path) -> Tuple[str, List[str]]:
+    req = bot_dir / "requirements.txt"
+    try:
+        req_hash = hashlib.sha256(req.read_bytes()).hexdigest() if req.exists() else "-"
+    except Exception:
+        req_hash = "-"
+    try:
+        imports = sorted(str(x) for x in _scan_imports(bot_dir))
+    except Exception:
+        imports = []
+    return req_hash, imports
+
+
 def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
     try:
         if kind == "python":
@@ -3254,25 +3267,40 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             deps_dir.mkdir(parents=True, exist_ok=True)
             req = bot_dir / "requirements.txt"
             pip_env = _pip_env(deps_dir)
+            needs_kuri = _needs_kurigram(bot_dir)
+            marker = deps_dir / ".panel_deps_ok.json"
+            req_hash, scanned_now = _dependency_fingerprint(bot_dir)
+            marker_data = _load_json(marker, {}) if marker.exists() else {}
 
-            # Kurigram intentionally provides the ``pyrogram`` namespace.
-            # Remove a stale/conflicting standard Pyrogram cache before any
-            # requirements or AST-scan installation can leave it in front of
-            # Kurigram. This is especially important on long-lived panels.
-            if _needs_kurigram(bot_dir):
+            # Fast path: a previously successful install for the same source
+            # state needs no network/pip work on a normal restart.
+            deps_current = (
+                isinstance(marker_data, dict)
+                and marker_data.get("requirements_sha256") == req_hash
+                and marker_data.get("imports") == scanned_now
+                and bool(marker_data.get("kurigram")) == bool(needs_kuri)
+                and (not needs_kuri or _kurigram_ready(bot_dir))
+            )
+            if deps_current:
+                log.append(f"[{G['ok']}] dependencies already installed; skipping pip")
+                return True
+
+            if needs_kuri:
                 _prepare_kurigram_deps(bot_dir, log)
 
-            # 1) requirements.txt (if present). For Kurigram projects, keep
-            # the pyrogram namespace out of the normal .deps target; installing
-            # it there first and then reinstalling it into .kurigram wastes RAM
-            # and can leave two competing implementations behind.
+            requirements_ok = True
             if req.exists():
                 req_for_pip = req
                 temp_req = None
-                if _needs_kurigram(bot_dir):
+                # For Kurigram projects, install the provider ourselves into
+                # .deps so a stale/explicit Pyrogram requirement cannot win.
+                if needs_kuri:
                     try:
                         lines = req.read_text(errors="ignore").splitlines()
-                        filtered = [ln for ln in lines if not re.match(r"^\s*kurigram(?:[<>=!~]|\s|$)", ln, re.I)]
+                        filtered = [
+                            ln for ln in lines
+                            if not re.match(r"^\s*(?:kurigram|pyrogram)(?:[<>=!~]|\s|$)", ln, re.I)
+                        ]
                         if len(filtered) != len(lines):
                             temp_req = bot_dir / ".requirements.panel.tmp.txt"
                             temp_req.write_text("\n".join(filtered) + "\n", encoding="utf-8")
@@ -3294,45 +3322,40 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
                     log.append(line)
                 for line in (r.stderr or "").splitlines()[-10:]:
                     log.append(line)
-                log.append(f"[{G['ok']}] requirements.txt done (rc={r.returncode})")
+                requirements_ok = (r.returncode == 0)
+                log.append(f"[{G['ok'] if requirements_ok else G['warn']}] requirements.txt done (rc={r.returncode})")
 
-            # If this is a Kurigram/AloneX project, explicitly install the
-            # provider after requirements. This prevents a stale Pyrogram
-            # package from winning the shared ``pyrogram`` namespace.
-            if _needs_kurigram(bot_dir):
-                _prepare_kurigram_deps(bot_dir, log)
-                kurigram_dir = bot_dir / ".kurigram"
-                log.append(f"{G['div']} enforcing isolated Kurigram for pyrogram namespace {G['div']}")
-                rk = subprocess.run(
-                    [sys.executable, "-m", "pip", "install",
-                     "--target", str(kurigram_dir), *_PIP_BASE_FLAGS,
-                     "--force-reinstall", "kurigram>=2.2.25"],
-                    cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
-                    env=pip_env,
-                )
-                for line in (rk.stdout or "").splitlines()[-10:]:
-                    log.append(line)
-                for line in (rk.stderr or "").splitlines()[-10:]:
-                    log.append(line)
-                log.append(f"[{G['ok'] if rk.returncode == 0 else G['warn']}] Kurigram enforcement done (rc={rk.returncode})")
+            if needs_kuri:
+                # Install Kurigram only if the isolated cache is not already
+                # usable. This is the only package allowed to own pyrogram/.
+                if not _kurigram_ready(bot_dir):
+                    log.append(f"{G['div']} installing Kurigram in bot .deps {G['div']}")
+                    rk = subprocess.run(
+                        [sys.executable, "-m", "pip", "install",
+                         "--target", str(deps_dir), *_PIP_BASE_FLAGS,
+                         "--force-reinstall", "kurigram>=2.2.25"],
+                        cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
+                        env=pip_env,
+                    )
+                    for line in (rk.stdout or "").splitlines()[-10:]:
+                        log.append(line)
+                    for line in (rk.stderr or "").splitlines()[-10:]:
+                        log.append(line)
+                    if rk.returncode != 0:
+                        log.append(f"[{G['warn']}] Kurigram install failed (rc={rk.returncode})")
+                        return False
 
-            # 2) AST-scan imports and install anything still missing.
-            #    We always do this so a bot that adds a new `import foo`
-            #    after upload doesn't crash on next start.
+            # Install scanned third-party imports only when genuinely missing.
+            # For Kurigram projects, pyrogram is already satisfied by Kurigram.
+            install_failures = 0
             try:
                 modules = _scan_imports(bot_dir)
                 third_party = _filter_third_party(modules, bot_dir)
-                # Kurigram is already installed explicitly in .kurigram.
-                # Never let the AST scanner reinstall it into .deps.
-                if _needs_kurigram(bot_dir):
-                    third_party = [x for x in third_party if str(x).lower() != "kurigram"]
+                if needs_kuri:
+                    third_party = [x for x in third_party if str(x).lower() not in {"kurigram", "pyrogram"}]
                 if third_party:
                     log.append(f"{G['div']} auto-install (scanned imports) {G['div']}")
                     log.append(f"📦 packages: {', '.join(third_party)}")
-                    # Install each scanned package independently. A missing/non-PyPI
-                    # local import such as `database` must not block valid packages
-                    # (for example Hydrogram) from being installed.
-                    install_failures = 0
                     for package in third_party:
                         r2 = subprocess.run(
                             [sys.executable, "-m", "pip", "install",
@@ -3349,13 +3372,23 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
                             log.append(f"[{G['warn']}] skipped package {package} (rc={r2.returncode}); continuing")
                         else:
                             log.append(f"[{G['ok']}] installed {package}")
-                    log.append(
-                        f"[{G['ok']}] auto-install scan finished "
-                        f"(failed={install_failures})"
-                    )
+                    log.append(f"[{G['ok']}] auto-install scan finished (failed={install_failures})")
             except Exception as e:
                 log.append(f"[{G['warn']}] auto-install scan error: {e}")
-            return True
+
+            # Never mark a failed requirements/Kurigram installation as ready.
+            ready = requirements_ok and (not needs_kuri or _kurigram_ready(bot_dir))
+            if ready:
+                try:
+                    _atomic_write(marker, {
+                        "requirements_sha256": req_hash,
+                        "imports": scanned_now,
+                        "kurigram": bool(needs_kuri),
+                        "updated_at": time.time(),
+                    })
+                except Exception:
+                    pass
+            return ready
         if kind == "node":
             pkg = bot_dir / "package.json"
             if not pkg.exists():
@@ -3551,7 +3584,9 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     # from many users cannot create a pip/npm memory spike that kills the
     # panel. Waiting users remain queued instead of spawning installers.
     with _INSTALL_SEMAPHORE:
-        install_deps(bot_dir, kind, log)
+        deps_ok = install_deps(bot_dir, kind, log)
+    if not deps_ok:
+        return {"ok": False, "error": "Dependency installation failed. Check Live Logs."}
     if b.get("status") != "running":
         b.pop("_restart_history", None)
     # Run every untrusted child through secure_exec.py. It disables core
@@ -3584,25 +3619,11 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     # Kurigram must come before the normal .deps cache because both Kurigram
     # and standard Pyrogram expose the same ``pyrogram`` import namespace.
     pp_parts = [str(bot_dir), str(entry_parent)]
-    if _needs_kurigram(bot_dir):
-        pp_parts.append(str(bot_dir / ".kurigram"))
     pp_parts.append(str(bot_dir / ".deps"))
     existing_pp = run_env.get("PYTHONPATH", "")
     if existing_pp:
         pp_parts.append(existing_pp)
     run_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pp_parts))
-    # Reserve the owner's per-bot RAM *before* spawning. This prevents a
-    # collection of otherwise-valid heavy bots from exhausting the host.
-    try:
-        plan_key = str(owner_doc.get("plan", "free") or "free")
-        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
-    except Exception:
-        ram_mb = 128
-    allowed, reason = _resource_admission_check(owner_doc, ram_mb)
-    if not allowed:
-        log.append(f"[{G['warn']}] {reason}")
-        return {"ok": False, "error": reason}
-
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(bot_dir), env=run_env,
@@ -16180,6 +16201,9 @@ def banner() -> None:
 
 def main() -> int:
     banner()
+    # Bind the health endpoint immediately. Railway/other hosts can otherwise
+    # restart the container while slow persistence/lock recovery is running.
+    _start_keepalive()
     global OWNER_ID, BRAND_TAG, ANNOUNCE_CHANNEL, _LOCK_FH_KEEPALIVE
     # Local singleton guard + Mongo distributed lease together cover both
     # duplicate processes in one container and duplicate replicas on hosts
@@ -16237,7 +16261,8 @@ def main() -> int:
     threading.Thread(target=cron_runner, daemon=True).start()
     threading.Thread(target=_verify_state_janitor, daemon=True, name="verify-janitor").start()
     _start_extra_background_threads()
-    _start_keepalive()
+    # Keepalive was started at the top of main() so health checks never wait
+    # for Mongo/persistence work.
     # Bot commands
     try:
         bot.set_my_commands([
@@ -16260,11 +16285,16 @@ def main() -> int:
         f"{bullet('GH Bkp',  'on' if gh_enabled() else 'off')}\n"
         f"{bullet('TG Bkp',  _tg_backup_channel() or 'off')}"
     )
-    # Auto-start bots that were running
+    # Auto-start previously running bots in background workers. Do not block
+    # Telegram polling/health checks while a bot performs a first-time pip
+    # install; the dependency semaphore still serializes heavy installers.
     for b in db_load()["bots"].values():
         if b.get("status") == "running":
-            try: start_child(b)
-            except Exception: pass
+            threading.Thread(
+                target=lambda bot_doc=b: start_child(bot_doc),
+                daemon=True,
+                name=f"autostart-{str(b.get('_id','bot'))[:12]}",
+            ).start()
     # Clear old webhook
     try:
         bot.remove_webhook()
