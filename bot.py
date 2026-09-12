@@ -392,7 +392,7 @@ try:
     _SCANNER_OK = True
 except Exception as _ssf_err:
     import sys as _sys
-    print(f"[security] optional security_scanner_free.py unavailable — using built-in scanner ({_ssf_err})", flush=True)
+    print(f"[security] security_scanner_free.py not found — using built-in scanner ({_ssf_err})", file=_sys.stderr)
     # Fall back to built-in _scan_file defined above
 
 
@@ -653,9 +653,6 @@ _PANEL_MONGO_DB = (_HOST_SECRET_ENV.get("PANEL_MONGO_DB") or "kryon_host").strip
 _MONGO_CLIENT = None
 _MONGO_DB = None
 _MONGO_LOCK = threading.RLock()
-_PANEL_LOCK_OWNER = secrets.token_hex(16)
-_PANEL_LOCK_TTL = 90
-_PANEL_LOCK_HEARTBEAT_STOP = threading.Event()
 
 def _mongo_db():
     global _MONGO_CLIENT, _MONGO_DB
@@ -704,71 +701,6 @@ def _mongo_put(kind: str, data: Any) -> bool:
     except Exception as e:
         print(f"[persistence] Mongo write failed ({kind}): {e}", flush=True)
         return False
-
-def _acquire_distributed_panel_lock() -> bool:
-    """Acquire a Mongo-backed lease so only one panel replica polls Telegram.
-
-    A filesystem lock only protects against duplicate processes sharing one
-    container. Platforms that restart/scale containers can otherwise run two
-    replicas against the same bot token, producing Telegram 409 conflicts and
-    concurrent whole-DB writes. The lease expires automatically if a replica
-    dies.
-    """
-    db = _mongo_db()
-    if db is None:
-        return True  # local-only deployments keep the existing file lock
-    try:
-        from pymongo import ReturnDocument
-        now = time.time()
-        doc = db.panel_state.find_one_and_update(
-            {"_id": "panel_runtime_lock",
-             "$or": [{"owner": _PANEL_LOCK_OWNER}, {"expires_at": {"$lt": now}}]},
-            {"$set": {"owner": _PANEL_LOCK_OWNER,
-                      "expires_at": now + _PANEL_LOCK_TTL,
-                      "updated_at": now}},
-            upsert=False, return_document=ReturnDocument.AFTER,
-        )
-        if doc and doc.get("owner") == _PANEL_LOCK_OWNER:
-            return True
-        # First owner creation. A unique _id makes simultaneous creation safe.
-        try:
-            db.panel_state.insert_one({"_id": "panel_runtime_lock",
-                                       "owner": _PANEL_LOCK_OWNER,
-                                       "expires_at": now + _PANEL_LOCK_TTL,
-                                       "updated_at": now})
-            return True
-        except Exception:
-            return False
-    except Exception as e:
-        print(f"[persistence] distributed panel lock failed: {e}", flush=True)
-        # Do not silently create multiple pollers when Mongo is configured but
-        # unavailable. The local instance can still serve as a safe fallback.
-        return False
-
-def _panel_lock_heartbeat() -> None:
-    while not _PANEL_LOCK_HEARTBEAT_STOP.wait(30):
-        db = _mongo_db()
-        if db is None:
-            continue
-        try:
-            db.panel_state.update_one(
-                {"_id": "panel_runtime_lock", "owner": _PANEL_LOCK_OWNER},
-                {"$set": {"expires_at": time.time() + _PANEL_LOCK_TTL,
-                          "updated_at": time.time()}},
-            )
-        except Exception as e:
-            print(f"[persistence] panel lock heartbeat failed: {e}", flush=True)
-
-def _release_distributed_panel_lock() -> None:
-    _PANEL_LOCK_HEARTBEAT_STOP.set()
-    db = _mongo_db()
-    if db is None:
-        return
-    try:
-        db.panel_state.delete_one({"_id": "panel_runtime_lock", "owner": _PANEL_LOCK_OWNER})
-    except Exception:
-        pass
-
 
 def _durable_restore_on_boot() -> None:
     """Recover local state from Mongo only when the local copy is absent/empty."""
@@ -1452,32 +1384,6 @@ def db_load_ro() -> Dict[str, Any]:
 
 def db_save(d: Dict[str, Any]) -> None:
     with _db_lock:
-        # Merge bot records against the newest on-disk snapshot before saving.
-        # A normal handler does db_load() -> mutate -> db_save(); if two users
-        # do that concurrently, the second handler may hold a stale snapshot
-        # and previously could erase the first user's newly-added bot. Missing
-        # bot IDs are therefore preserved unless a persistent tombstone says
-        # that deletion was intentional. All normal deletes go through
-        # delete_bot_doc(), which creates that tombstone first.
-        try:
-            current = _ensure_db_defaults(copy.deepcopy(_cached_load(DB_FILE, {})))
-            incoming = copy.deepcopy(d)
-            current_bots = current.get("bots", {}) or {}
-            incoming_bots = incoming.get("bots", {}) or {}
-            deleted_ids = _deleted_bot_ids()
-            merged_bots = dict(current_bots)
-            for bid, doc in incoming_bots.items():
-                if str(bid) not in deleted_ids:
-                    merged_bots[str(bid)] = doc
-            for bid in list(merged_bots.keys()):
-                if str(bid) in deleted_ids:
-                    merged_bots.pop(bid, None)
-            incoming["bots"] = merged_bots
-            d = incoming
-        except Exception:
-            # Never block a save because the merge helper failed; the atomic
-            # writer below still guarantees a valid JSON snapshot.
-            pass
         # Encrypt child ENV values on disk; keep the caller's in-memory copy
         # unchanged so runtime code can use normal strings.
         protected = _encrypt_db_copy(d)
@@ -2585,69 +2491,7 @@ RUNNING: Dict[str, Dict[str, Any]] = {}    # bot_id -> {proc, kind, started, log
 START_TIME: float = time.time()            # panel boot time, for uptime card
 _LOCK_FH_KEEPALIVE: Any = None             # singleton-lock fd, kept alive for the process lifetime
 _runner_lock = threading.Lock()
-# Limit concurrent dependency installations.  pip/npm are CPU + RAM hungry;
-# allowing every user's first start to install at once can OOM the panel even
-# when the child bots themselves are within their plan limits.
-_INSTALL_SEMAPHORE = threading.BoundedSemaphore(1)
 SECURE_EXEC = BASE_DIR / "secure_exec.py"
-
-# Host-wide child resource admission control.  Per-bot RAM limits alone are
-# insufficient: e.g. 20 users can each start a 512 MB bot on a 2 GB host and
-# the Linux OOM killer may terminate the panel itself.  We reserve the plan
-# limit before spawning a child and keep a safety margin for the panel/OS.
-_CHILD_RAM_BUDGET_RATIO = 0.70
-_CHILD_RAM_MIN_RESERVE_MB = 96
-_CHILD_MAX_RUNNING_DEFAULT = 0
-
-def _host_child_ram_budget_mb() -> int:
-    if psutil is None:
-        return 0
-    try:
-        total_mb = int(psutil.virtual_memory().total // (1024 * 1024))
-        return max(128, int(total_mb * _CHILD_RAM_BUDGET_RATIO))
-    except Exception:
-        return 0
-
-def _running_child_ram_reservation_mb() -> int:
-    total = 0
-    if psutil is None:
-        return 0
-    for bid, info in list(RUNNING.items()):
-        try:
-            proc = info.get("proc")
-            if not proc or proc.poll() is not None:
-                continue
-            total += max(_CHILD_RAM_MIN_RESERVE_MB, int(info.get("ram_limit_mb", 0) or 0))
-        except Exception:
-            continue
-    return total
-
-def _resource_admission_check(owner_doc: Dict[str, Any], requested_ram_mb: int) -> Tuple[bool, str]:
-    """Refuse a new child when its *reserved* RAM would exceed host capacity.
-
-    This is intentionally an admission check rather than a late kill: the
-    safest way to keep the hosting panel alive is to never create an
-    impossible set of child processes in the first place.
-    """
-    if psutil is None:
-        return True, ""
-    requested = max(_CHILD_RAM_MIN_RESERVE_MB, int(requested_ram_mb or 0))
-    budget = _host_child_ram_budget_mb()
-    if budget <= 0:
-        return True, ""
-    with _runner_lock:
-        reserved = _running_child_ram_reservation_mb()
-        running_count = sum(1 for x in RUNNING.values()
-                            if x.get("proc") and x["proc"].poll() is None)
-    max_running = int(os.environ.get("PANEL_MAX_RUNNING_BOTS", str(_CHILD_MAX_RUNNING_DEFAULT)) or 0)
-    if max_running > 0 and running_count >= max_running:
-        return False, f"Host capacity reached ({max_running} bots running). Try again later."
-    if reserved + requested > budget:
-        available = max(0, budget - reserved)
-        return False, (f"Host RAM capacity is protected: need {requested} MB, "
-                       f"only about {available} MB is currently reservable. "
-                       "Stop another bot or upgrade/move to a larger host.")
-    return True, ""
 
 
 _SKIP_DIR_PARTS = {".deps", "node_modules", ".tmp_run", "__pycache__",
@@ -2952,9 +2796,7 @@ _PYPI_ALIAS: Dict[str, str] = {
     # the installed copy in `_filter_third_party`.
     "telegram":      "python-telegram-bot",
     "telethon":      "Telethon",
-    # AloneX/Kurigram projects import the `pyrogram` compatibility module.
-    # Do not install the unrelated Pyrogram distribution over Kurigram.
-    "pyrogram":      "kurigram",
+    "pyrogram":      "Pyrogram",
     "hydrogram":     "hydrogram",
     "pyromod":       "pyromod",
     "tgcrypto":      "TgCrypto",
@@ -2988,9 +2830,6 @@ _PYPI_ALIAS: Dict[str, str] = {
     "starlette":     "starlette",
     "redis":         "redis",
     "pymongo":       "pymongo",
-    # Common import-name mismatches used by music bots.
-    "pytgcalls":     "py-tgcalls",
-    "py_yt":         "py-yt-search",
     "motor":         "motor",
     "psutil":        "psutil",
     "schedule":      "schedule",
@@ -3071,6 +2910,71 @@ def _scan_imports(bot_dir: Path) -> List[str]:
     return sorted(found)
 
 
+def _needs_kurigram(bot_dir: Path) -> bool:
+    """Detect bots that intentionally use Kurigram-only Pyrogram APIs.
+
+    Kurigram provides the ``pyrogram`` import namespace, so these projects
+    must never have the ordinary Pyrogram distribution installed by the
+    generic import scanner. This detection is deliberately limited to the
+    bot directory and does not affect normal Pyrogram bots.
+    """
+    try:
+        for pyfile in bot_dir.rglob("*.py"):
+            if ".deps" in pyfile.parts or "__pycache__" in pyfile.parts:
+                continue
+            text = pyfile.read_text(errors="ignore")
+            if "ButtonStyle" in text or "max_concurrent_transmissions" in text:
+                return True
+    except Exception:
+        pass
+    try:
+        req = bot_dir / "requirements.txt"
+        if req.exists():
+            for raw in req.read_text(errors="ignore").splitlines():
+                line = raw.strip().lower()
+                if line and not line.startswith("#") and re.match(r"^kurigram(?:[<>=!~]|$)", line):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _kurigram_ready(bot_dir: Path) -> bool:
+    """Return True when this bot's .deps contains a usable Kurigram namespace."""
+    try:
+        enums_py = bot_dir / ".deps" / "pyrogram" / "enums.py"
+        return enums_py.is_file() and "ButtonStyle" in enums_py.read_text(errors="ignore")
+    except Exception:
+        return False
+
+
+def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
+    """Remove only stale standard-Pyrogram files from this bot's cache."""
+    deps_dir = bot_dir / ".deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    removed = False
+    try:
+        py_pkg = deps_dir / "pyrogram"
+        if py_pkg.exists():
+            shutil.rmtree(str(py_pkg), ignore_errors=True)
+            removed = True
+        for child in list(deps_dir.iterdir()):
+            low = child.name.lower()
+            if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(str(child), ignore_errors=True)
+                    else:
+                        child.unlink()
+                    removed = True
+                except Exception:
+                    pass
+    except Exception as e:
+        log.append(f"[{G['warn']}] Kurigram cache cleanup warning: {e}")
+    if removed:
+        log.append(f"[{G['ok']}] removed stale Pyrogram cache; Kurigram will provide pyrogram")
+
+
 def _filter_third_party(modules: List[str], bot_dir: Path) -> List[str]:
     """Drop stdlib, local module names, and modules already importable
     from the bot's .deps cache. Returns only installable PyPI names that
@@ -3107,42 +3011,32 @@ def _filter_third_party(modules: List[str], bot_dir: Path) -> List[str]:
             # Already importable (stdlib was caught above; this catches
             # things like cv2 already installed in .deps/).
             try:
+                if m == "pyrogram" and _needs_kurigram(bot_dir):
+                    # Kurigram intentionally owns the pyrogram namespace for
+                    # these bots. Never let the generic scanner install the
+                    # unrelated Pyrogram distribution over it.
+                    continue
                 if _ilu.find_spec(m) is not None:
-                    # Kurigram intentionally exposes the `pyrogram` import
-                    # namespace. A host may already have the old Pyrogram
-                    # package installed globally, so merely finding
-                    # `pyrogram` is NOT enough for AloneX/Kurigram bots.
-                    # Detect the Kurigram-only API used by these bots and
-                    # install Kurigram into the bot's isolated .deps when
-                    # the global copy is the wrong implementation.
-                    if m == "pyrogram":
+                    # Even if importable, validate that the installed
+                    # copy is the RIGHT package (not the wrong-name
+                    # PyPI shim). If it isn't, nuke it so pip can
+                    # reinstall the correct one below.
+                    needed = _VALIDATE_SYMBOLS.get(m)
+                    if needed:
                         try:
                             _real = importlib.import_module(m)
-                            _enums = getattr(_real, "enums", None)
-                            if _enums is not None and hasattr(_enums, "ButtonStyle"):
+                            if all(hasattr(_real, s) for s in needed):
                                 continue
                         except Exception:
                             pass
+                        # Wrong package — purge and force a reinstall.
+                        try:
+                            del sys.modules[m]
+                        except KeyError:
+                            pass
+                        _purge_bad_install(deps_dir, m)
                     else:
-                        # Even if importable, validate that the installed
-                        # copy is the RIGHT package (not the wrong-name
-                        # PyPI shim). If it isn't, nuke it so pip can
-                        # reinstall the correct one below.
-                        needed = _VALIDATE_SYMBOLS.get(m)
-                        if needed:
-                            try:
-                                _real = importlib.import_module(m)
-                                if all(hasattr(_real, s) for s in needed):
-                                    continue
-                            except Exception:
-                                pass
-                            try:
-                                del sys.modules[m]
-                            except KeyError:
-                                pass
-                            _purge_bad_install(deps_dir, m)
-                        else:
-                            continue
+                        continue
             except (ImportError, ValueError):
                 pass
             pip_name = _PYPI_ALIAS.get(m, m)
@@ -3169,8 +3063,7 @@ def _pip_env(deps_dir: Path) -> Dict[str, str]:
     env = {**os.environ,
            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
            "PIP_NO_INPUT": "1",
-           "PIP_ROOT_USER_ACTION": "ignore",
-           "PIP_NO_CACHE_DIR": "1"}
+           "PIP_ROOT_USER_ACTION": "ignore"}
     env.pop("PYTHONUSERBASE", None)
     env.pop("PIP_USER", None)
     return env
@@ -3178,86 +3071,6 @@ def _pip_env(deps_dir: Path) -> Dict[str, str]:
 
 _PIP_BASE_FLAGS = ["--upgrade", "--no-input", "--no-warn-script-location",
                    "--disable-pip-version-check"]
-
-
-def _kurigram_ready(bot_dir: Path) -> bool:
-    """Return True when the bot's isolated dependency cache has Kurigram."""
-    try:
-        enums_py = bot_dir / ".deps" / "pyrogram" / "enums.py"
-        if not enums_py.is_file():
-            return False
-        return "ButtonStyle" in enums_py.read_text(errors="ignore")
-    except Exception:
-        return False
-
-
-def _prepare_kurigram_deps(bot_dir: Path, log: List[str]) -> None:
-    """Remove only conflicting standard-Pyrogram files from this bot cache.
-
-    Kurigram deliberately uses the ``pyrogram`` import namespace. Keeping the
-    two distributions in the same per-bot target is unsafe because whichever
-    files were installed last can win. We therefore clean only that namespace
-    and leave every unrelated dependency untouched.
-    """
-    deps_dir = bot_dir / ".deps"
-    deps_dir.mkdir(parents=True, exist_ok=True)
-    removed = False
-    try:
-        py_pkg = deps_dir / "pyrogram"
-        if py_pkg.exists():
-            shutil.rmtree(str(py_pkg), ignore_errors=True)
-            removed = True
-        for child in list(deps_dir.iterdir()):
-            low = child.name.lower()
-            if low.startswith("pyrogram-") and low.endswith((".dist-info", ".egg-info")):
-                if child.is_dir():
-                    shutil.rmtree(str(child), ignore_errors=True)
-                else:
-                    try:
-                        child.unlink()
-                    except Exception:
-                        pass
-                removed = True
-    except Exception as e:
-        log.append(f"[{G['warn']}] Kurigram cache cleanup warning: {e}")
-    if removed:
-        log.append(f"[{G['ok']}] removed conflicting Pyrogram cache; installing Kurigram in .deps")
-
-
-def _needs_kurigram(bot_dir: Path) -> bool:
-    """Detect projects that require Kurigram-only Pyrogram APIs."""
-    try:
-        for pyfile in bot_dir.rglob("*.py"):
-            if ".deps" in pyfile.parts or "__pycache__" in pyfile.parts:
-                continue
-            text = pyfile.read_text(errors="ignore")
-            if "ButtonStyle" in text or "max_concurrent_transmissions" in text:
-                return True
-    except Exception:
-        pass
-    try:
-        req = bot_dir / "requirements.txt"
-        if req.exists():
-            for raw in req.read_text(errors="ignore").splitlines():
-                line = raw.strip().lower()
-                if line and not line.startswith("#") and re.match(r"^kurigram(?:[<>=!~]|$)", line):
-                    return True
-    except Exception:
-        pass
-    return False
-
-
-def _dependency_fingerprint(bot_dir: Path) -> Tuple[str, List[str]]:
-    req = bot_dir / "requirements.txt"
-    try:
-        req_hash = hashlib.sha256(req.read_bytes()).hexdigest() if req.exists() else "-"
-    except Exception:
-        req_hash = "-"
-    try:
-        imports = sorted(str(x) for x in _scan_imports(bot_dir))
-    except Exception:
-        imports = []
-    return req_hash, imports
 
 
 def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
@@ -3268,94 +3081,60 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             req = bot_dir / "requirements.txt"
             pip_env = _pip_env(deps_dir)
             needs_kuri = _needs_kurigram(bot_dir)
-            marker = deps_dir / ".panel_deps_ok.json"
-            req_hash, scanned_now = _dependency_fingerprint(bot_dir)
-            marker_data = _load_json(marker, {}) if marker.exists() else {}
-
-            # Fast path: a previously successful install for the same source
-            # state needs no network/pip work on a normal restart.
-            deps_current = (
-                isinstance(marker_data, dict)
-                and marker_data.get("requirements_sha256") == req_hash
-                and marker_data.get("imports") == scanned_now
-                and bool(marker_data.get("kurigram")) == bool(needs_kuri)
-                and (not needs_kuri or _kurigram_ready(bot_dir))
-            )
-            if deps_current:
-                log.append(f"[{G['ok']}] dependencies already installed; skipping pip")
-                return True
-
             if needs_kuri:
+                # Remove an old standard-Pyrogram cache before requirements
+                # are installed. This is the only special handling for
+                # Kurigram projects; normal Pyrogram bots are untouched.
                 _prepare_kurigram_deps(bot_dir, log)
 
-            requirements_ok = True
+            # 1) requirements.txt (if present)
             if req.exists():
-                req_for_pip = req
-                temp_req = None
-                # For Kurigram projects, install the provider ourselves into
-                # .deps so a stale/explicit Pyrogram requirement cannot win.
-                if needs_kuri:
-                    try:
-                        lines = req.read_text(errors="ignore").splitlines()
-                        filtered = [
-                            ln for ln in lines
-                            if not re.match(r"^\s*(?:kurigram|pyrogram)(?:[<>=!~]|\s|$)", ln, re.I)
-                        ]
-                        if len(filtered) != len(lines):
-                            temp_req = bot_dir / ".requirements.panel.tmp.txt"
-                            temp_req.write_text("\n".join(filtered) + "\n", encoding="utf-8")
-                            req_for_pip = temp_req
-                    except Exception as e:
-                        log.append(f"[{G['warn']}] requirements filter warning: {e}")
                 log.append(f"{G['div']} pip install (requirements.txt) {G['div']}")
                 r = subprocess.run(
                     [sys.executable, "-m", "pip", "install",
                      "--target", str(deps_dir), *_PIP_BASE_FLAGS,
-                     "-r", str(req_for_pip)],
+                     "-r", str(req)],
                     cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
                     env=pip_env,
                 )
-                if temp_req is not None:
-                    try: temp_req.unlink(missing_ok=True)
-                    except Exception: pass
                 for line in (r.stdout or "").splitlines()[-15:]:
                     log.append(line)
                 for line in (r.stderr or "").splitlines()[-10:]:
                     log.append(line)
-                requirements_ok = (r.returncode == 0)
-                log.append(f"[{G['ok'] if requirements_ok else G['warn']}] requirements.txt done (rc={r.returncode})")
+                log.append(f"[{G['ok']}] requirements.txt done (rc={r.returncode})")
 
-            if needs_kuri:
-                # Install Kurigram only if the isolated cache is not already
-                # usable. This is the only package allowed to own pyrogram/.
-                if not _kurigram_ready(bot_dir):
-                    log.append(f"{G['div']} installing Kurigram in bot .deps {G['div']}")
-                    rk = subprocess.run(
-                        [sys.executable, "-m", "pip", "install",
-                         "--target", str(deps_dir), *_PIP_BASE_FLAGS,
-                         "--force-reinstall", "kurigram>=2.2.25"],
-                        cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
-                        env=pip_env,
-                    )
-                    for line in (rk.stdout or "").splitlines()[-10:]:
-                        log.append(line)
-                    for line in (rk.stderr or "").splitlines()[-10:]:
-                        log.append(line)
-                    if rk.returncode != 0:
-                        log.append(f"[{G['warn']}] Kurigram install failed (rc={rk.returncode})")
-                        return False
+            # For Kurigram bots, requirements.txt normally provides Kurigram.
+            # If it did not, install it explicitly once. Never reinstall a
+            # working copy on every restart.
+            if needs_kuri and not _kurigram_ready(bot_dir):
+                log.append(f"{G['div']} installing missing Kurigram provider {G['div']}")
+                rk = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "--target", str(deps_dir), *_PIP_BASE_FLAGS,
+                     "--force-reinstall", "kurigram>=2.2.25"],
+                    cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
+                    env=pip_env,
+                )
+                for line in (rk.stdout or "").splitlines()[-10:]:
+                    log.append(line)
+                for line in (rk.stderr or "").splitlines()[-10:]:
+                    log.append(line)
+                if rk.returncode != 0:
+                    log.append(f"[{G['warn']}] Kurigram install failed (rc={rk.returncode})")
 
-            # Install scanned third-party imports only when genuinely missing.
-            # For Kurigram projects, pyrogram is already satisfied by Kurigram.
-            install_failures = 0
+            # 2) AST-scan imports and install anything still missing.
+            #    We always do this so a bot that adds a new `import foo`
+            #    after upload doesn't crash on next start.
             try:
                 modules = _scan_imports(bot_dir)
                 third_party = _filter_third_party(modules, bot_dir)
-                if needs_kuri:
-                    third_party = [x for x in third_party if str(x).lower() not in {"kurigram", "pyrogram"}]
                 if third_party:
                     log.append(f"{G['div']} auto-install (scanned imports) {G['div']}")
                     log.append(f"📦 packages: {', '.join(third_party)}")
+                    # Install each scanned package independently. A missing/non-PyPI
+                    # local import such as `database` must not block valid packages
+                    # (for example Hydrogram) from being installed.
+                    install_failures = 0
                     for package in third_party:
                         r2 = subprocess.run(
                             [sys.executable, "-m", "pip", "install",
@@ -3372,23 +3151,13 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
                             log.append(f"[{G['warn']}] skipped package {package} (rc={r2.returncode}); continuing")
                         else:
                             log.append(f"[{G['ok']}] installed {package}")
-                    log.append(f"[{G['ok']}] auto-install scan finished (failed={install_failures})")
+                    log.append(
+                        f"[{G['ok']}] auto-install scan finished "
+                        f"(failed={install_failures})"
+                    )
             except Exception as e:
                 log.append(f"[{G['warn']}] auto-install scan error: {e}")
-
-            # Never mark a failed requirements/Kurigram installation as ready.
-            ready = requirements_ok and (not needs_kuri or _kurigram_ready(bot_dir))
-            if ready:
-                try:
-                    _atomic_write(marker, {
-                        "requirements_sha256": req_hash,
-                        "imports": scanned_now,
-                        "kurigram": bool(needs_kuri),
-                        "updated_at": time.time(),
-                    })
-                except Exception:
-                    pass
-            return ready
+            return True
         if kind == "node":
             pkg = bot_dir / "package.json"
             if not pkg.exists():
@@ -3568,27 +3337,9 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "No entry file (index.js / bot.py)."}
 
     log: List[str] = [f"{G['div_eq']} START {ts_iso()} {G['div_eq']}"]
-    # Reserve the owner's per-bot RAM *before* spawning. This prevents a
-    # collection of otherwise-valid heavy bots from exhausting the host.
-    try:
-        plan_key = str(owner_doc.get("plan", "free") or "free")
-        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
-    except Exception:
-        ram_mb = 128
-    allowed, reason = _resource_admission_check(owner_doc, ram_mb)
-    if not allowed:
-        log.append(f"[{G['warn']}] {reason}")
-        return {"ok": False, "error": reason}
-
-    # Dependency installation is serialized/limited so simultaneous uploads
-    # from many users cannot create a pip/npm memory spike that kills the
-    # panel. Waiting users remain queued instead of spawning installers.
-    with _INSTALL_SEMAPHORE:
-        deps_ok = install_deps(bot_dir, kind, log)
-    if not deps_ok:
-        return {"ok": False, "error": "Dependency installation failed. Check Live Logs."}
     if b.get("status") != "running":
         b.pop("_restart_history", None)
+    install_deps(bot_dir, kind, log)
     # Run every untrusted child through secure_exec.py. It disables core
     # dumps/ptrace visibility (PR_SET_DUMPABLE=0 where supported) before
     # exec'ing the real bot, reducing cross-process credential exposure.
@@ -3616,10 +3367,7 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     # Keep both the project root and the entry file's directory importable.
     # This is important for ZIPs such as MyBot/main.py + database.py.
     entry_parent = (bot_dir / entry).parent
-    # Kurigram must come before the normal .deps cache because both Kurigram
-    # and standard Pyrogram expose the same ``pyrogram`` import namespace.
-    pp_parts = [str(bot_dir), str(entry_parent)]
-    pp_parts.append(str(bot_dir / ".deps"))
+    pp_parts = [str(bot_dir), str(entry_parent), str(bot_dir / ".deps")]
     existing_pp = run_env.get("PYTHONPATH", "")
     if existing_pp:
         pp_parts.append(existing_pp)
@@ -3637,7 +3385,6 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
         "proc": proc, "kind": kind, "started": time.time() * 1000,
         "log": log, "dir": str(bot_dir), "name": b["name"],
         "owner": b["owner"], "manual_stop": False,
-        "ram_limit_mb": ram_mb,
     }
     with _runner_lock:
         RUNNING[bid] = info
@@ -3645,6 +3392,8 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
 
     # Enforce the RAM allowance attached to the owner's active plan.
     try:
+        plan_key = str(owner_doc.get("plan", "free") or "free")
+        ram_mb = int(PLAN_LIMITS.get(plan_key, PLAN_LIMITS["free"]).get("ram", 0) or 0)
         if psutil is not None and ram_mb > 0:
             threading.Thread(
                 target=_watch_child_memory, args=(bid, proc.pid, ram_mb), daemon=True,
@@ -6807,7 +6556,8 @@ def action_adm_gh_run_file(call: types.CallbackQuery, repo: str, path: str) -> N
                 "source":       f"github:{repo}/{path}",
                 "last_exit_code": None,
             }
-            save_bot(new_bot)
+            d_db["bots"][bid] = new_bot
+            db_save(d_db)
             audit(owner, "gh_run_file", f"repo={repo} path={path} bid={bid}")
             # Start the bot
             result = start_child(new_bot)
@@ -9098,10 +8848,11 @@ def reject_bot(bot_id: str, admin_uid: int, reason: str = "") -> Dict[str, Any]:
         rmrf(b.get("dir", ""))
     except Exception:
         pass
-    # Remove the bot entry atomically and create a tombstone so a stale
-    # handler/worker cannot reinsert it.
+    # Remove the bot entry so the user's slot frees up
     try:
-        delete_bot_doc(bot_id)
+        db = db_load()
+        db["bots"].pop(bot_id, None)
+        db_save(db)
     except Exception:
         pass
     audit(admin_uid, "reject_bot", f"bot={bot_id} reason={reason}")
@@ -9961,7 +9712,7 @@ def _plan_enforce_bot_limit(uid):
     u = d["users"].get(str(uid), {})
     plan   = u.get("plan", "free") or "free"
     limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
-    max_b  = int(limits.get("max_bots", 1) or 1)
+    max_b  = limits.get("bots", 1)
     if max_b == -1:
         return True, ""
     cur = sum(1 for b in d["bots"].values() if str(b.get("owner")) == str(uid))
@@ -12047,7 +11798,8 @@ def _action_gh_file_run(call: types.CallbackQuery, path: str) -> None:
                 "source": "github_browser", "gh_path": path, "entry": fname,
             }
             d = db_load()
-            save_bot(doc)
+            d["bots"][bot_id] = doc
+            db_save(d)
             audit(uid, "gh_browser_run", f"path={path} bot_id={bot_id}")
             res = start_child(doc)
             bot.send_message(uid,
@@ -13322,7 +13074,9 @@ def action_bot_clone(call: types.CallbackQuery, bot_id: str) -> None:
         "created": ts_iso(), "status": "stopped",
     })
     new_doc.pop("last_started", None)
-    save_bot(new_doc)
+    d = db_load()
+    d["bots"][new_id] = new_doc
+    db_save(d)
     audit(uid, "bot_clone", f"src={bot_id} new={new_id}")
     bot.send_message(uid,
         f"<b>{G['ok']} {sc('Bot cloned')}</b>\n{bullet('New Bot ID', new_id)}\n{bullet('Name', new_doc['name'])}",
@@ -15831,7 +15585,9 @@ def on_text(m: types.Message) -> None:
                     "enc_files": {}, "env": {}, "status": "stopped", "cron": {},
                     "source": "github", "gh_repo": repo_url, "entry": entry,
                 }
-                save_bot(doc)
+                d3 = db_load()
+                d3["bots"][bot_id] = doc
+                db_save(d3)
                 audit(uid, "gh_repo_clone", f"repo={repo_url} bot_id={bot_id}")
                 try:
                     bot.send_message(uid,
@@ -16003,9 +15759,7 @@ def on_text(m: types.Message) -> None:
                 if str(b.get("owner")) == target_uid_str:
                     try: stop_child(b["_id"])
                     except Exception: pass
-                    try: delete_bot_doc(b["_id"])
-                    except Exception: pass
-            d = db_load()
+                    d["bots"].pop(b["_id"], None)
             d["users"][target_uid_str]["plan"] = "free"
             d["users"][target_uid_str]["plan_expires"] = None
             d["users"][target_uid_str]["wallet"] = 0
@@ -16201,14 +15955,7 @@ def banner() -> None:
 
 def main() -> int:
     banner()
-    # Bind the health endpoint immediately. Railway/other hosts can otherwise
-    # restart the container while slow persistence/lock recovery is running.
-    _start_keepalive()
-    global OWNER_ID, BRAND_TAG, ANNOUNCE_CHANNEL, _LOCK_FH_KEEPALIVE
-    # Local singleton guard + Mongo distributed lease together cover both
-    # duplicate processes in one container and duplicate replicas on hosts
-    # that scale/redeploy services.
-    _LOCK_FH_KEEPALIVE = _acquire_singleton_lock()
+    global OWNER_ID, BRAND_TAG, ANNOUNCE_CHANNEL
     stored_owner = int(get_setting("owner_id", 0) or 0)
     if stored_owner > 0 and OWNER_ID <= 0:
         OWNER_ID = stored_owner
@@ -16222,18 +15969,6 @@ def main() -> int:
     GH["autoEnabled"] = bool(get_setting("github_auto_enabled", True))
     # Recover the master state before any other boot-time restoration logic.
     _durable_restore_on_boot()
-    # On multi-replica hosts, only one instance may poll the Telegram token.
-    # Otherwise Telegram returns 409 and both instances can race whole-DB
-    # persistence, making recently deployed bots appear to disappear.
-    # Never exit just because another replica currently owns the Telegram
-    # lease. Container hosts commonly restart exited processes, which would
-    # create a tight restart loop. Wait here until the lease is available.
-    while not _acquire_distributed_panel_lock():
-        print("[persistence] Telegram lease is currently owned by another panel instance; waiting...", flush=True)
-        time.sleep(10)
-    print("[persistence] Telegram panel lease acquired.", flush=True)
-    threading.Thread(target=_panel_lock_heartbeat, daemon=True,
-                     name="panel-mongo-lock-heartbeat").start()
     cache_clear_all()
     try:
         set_setting("payment_currency", "INR")
@@ -16261,8 +15996,7 @@ def main() -> int:
     threading.Thread(target=cron_runner, daemon=True).start()
     threading.Thread(target=_verify_state_janitor, daemon=True, name="verify-janitor").start()
     _start_extra_background_threads()
-    # Keepalive was started at the top of main() so health checks never wait
-    # for Mongo/persistence work.
+    _start_keepalive()
     # Bot commands
     try:
         bot.set_my_commands([
@@ -16285,16 +16019,11 @@ def main() -> int:
         f"{bullet('GH Bkp',  'on' if gh_enabled() else 'off')}\n"
         f"{bullet('TG Bkp',  _tg_backup_channel() or 'off')}"
     )
-    # Auto-start previously running bots in background workers. Do not block
-    # Telegram polling/health checks while a bot performs a first-time pip
-    # install; the dependency semaphore still serializes heavy installers.
+    # Auto-start bots that were running
     for b in db_load()["bots"].values():
         if b.get("status") == "running":
-            threading.Thread(
-                target=lambda bot_doc=b: start_child(bot_doc),
-                daemon=True,
-                name=f"autostart-{str(b.get('_id','bot'))[:12]}",
-            ).start()
+            try: start_child(b)
+            except Exception: pass
     # Clear old webhook
     try:
         bot.remove_webhook()
