@@ -2588,7 +2588,7 @@ _runner_lock = threading.Lock()
 # Limit concurrent dependency installations.  pip/npm are CPU + RAM hungry;
 # allowing every user's first start to install at once can OOM the panel even
 # when the child bots themselves are within their plan limits.
-_INSTALL_SEMAPHORE = threading.BoundedSemaphore(2)
+_INSTALL_SEMAPHORE = threading.BoundedSemaphore(1)
 SECURE_EXEC = BASE_DIR / "secure_exec.py"
 
 # Host-wide child resource admission control.  Per-bot RAM limits alone are
@@ -3169,7 +3169,8 @@ def _pip_env(deps_dir: Path) -> Dict[str, str]:
     env = {**os.environ,
            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
            "PIP_NO_INPUT": "1",
-           "PIP_ROOT_USER_ACTION": "ignore"}
+           "PIP_ROOT_USER_ACTION": "ignore",
+           "PIP_NO_CACHE_DIR": "1"}
     env.pop("PYTHONUSERBASE", None)
     env.pop("PIP_USER", None)
     return env
@@ -3261,16 +3262,34 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             if _needs_kurigram(bot_dir):
                 _prepare_kurigram_deps(bot_dir, log)
 
-            # 1) requirements.txt (if present)
+            # 1) requirements.txt (if present). For Kurigram projects, keep
+            # the pyrogram namespace out of the normal .deps target; installing
+            # it there first and then reinstalling it into .kurigram wastes RAM
+            # and can leave two competing implementations behind.
             if req.exists():
+                req_for_pip = req
+                temp_req = None
+                if _needs_kurigram(bot_dir):
+                    try:
+                        lines = req.read_text(errors="ignore").splitlines()
+                        filtered = [ln for ln in lines if not re.match(r"^\s*kurigram(?:[<>=!~]|\s|$)", ln, re.I)]
+                        if len(filtered) != len(lines):
+                            temp_req = bot_dir / ".requirements.panel.tmp.txt"
+                            temp_req.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+                            req_for_pip = temp_req
+                    except Exception as e:
+                        log.append(f"[{G['warn']}] requirements filter warning: {e}")
                 log.append(f"{G['div']} pip install (requirements.txt) {G['div']}")
                 r = subprocess.run(
                     [sys.executable, "-m", "pip", "install",
                      "--target", str(deps_dir), *_PIP_BASE_FLAGS,
-                     "-r", str(req)],
+                     "-r", str(req_for_pip)],
                     cwd=str(bot_dir), timeout=600, capture_output=True, text=True,
                     env=pip_env,
                 )
+                if temp_req is not None:
+                    try: temp_req.unlink(missing_ok=True)
+                    except Exception: pass
                 for line in (r.stdout or "").splitlines()[-15:]:
                     log.append(line)
                 for line in (r.stderr or "").splitlines()[-10:]:
@@ -3303,6 +3322,10 @@ def install_deps(bot_dir: Path, kind: str, log: List[str]) -> bool:
             try:
                 modules = _scan_imports(bot_dir)
                 third_party = _filter_third_party(modules, bot_dir)
+                # Kurigram is already installed explicitly in .kurigram.
+                # Never let the AST scanner reinstall it into .deps.
+                if _needs_kurigram(bot_dir):
+                    third_party = [x for x in third_party if str(x).lower() != "kurigram"]
                 if third_party:
                     log.append(f"{G['div']} auto-install (scanned imports) {G['div']}")
                     log.append(f"📦 packages: {', '.join(third_party)}")
