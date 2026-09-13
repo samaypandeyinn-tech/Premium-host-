@@ -702,6 +702,82 @@ def _mongo_put(kind: str, data: Any) -> bool:
         print(f"[persistence] Mongo write failed ({kind}): {e}", flush=True)
         return False
 
+
+def _mongo_blob_put(bot_id: str, key_id: str, filename: str, cipher: bytes) -> Optional[str]:
+    """Persist an encrypted child file in MongoDB GridFS.
+
+    The panel's sandbox/encfiles directories are ephemeral on most hosting
+    platforms.  DB metadata alone is therefore not enough to survive a
+    redeploy.  GridFS keeps the encrypted bytes in the same durable Mongo
+    service as the panel state, without putting plaintext source in Mongo.
+    """
+    db = _mongo_db()
+    if db is None:
+        return None
+    try:
+        from gridfs import GridFSBucket
+        from bson import ObjectId
+        bucket = GridFSBucket(db, bucket_name="bot_files")
+        # Remove an older copy for the same bot/key before replacing it.
+        old = db["bot_files.files"].find_one({"metadata.bot_id": str(bot_id),
+                                               "metadata.key_id": str(key_id)})
+        if old and old.get("_id"):
+            try:
+                bucket.delete(old["_id"])
+            except Exception:
+                pass
+        fid = bucket.upload_from_stream(
+            filename or "bot_file",
+            bytes(cipher),
+            metadata={"bot_id": str(bot_id), "key_id": str(key_id),
+                      "filename": str(filename or "bot_file"), "updated_at": time.time()},
+        )
+        return str(fid)
+    except Exception as e:
+        print(f"[persistence] Mongo bot-file write failed ({bot_id}/{filename}): {e}", flush=True)
+        return None
+
+
+def _mongo_blob_get(file_id: str) -> Optional[bytes]:
+    """Read one encrypted child file from GridFS by string ObjectId."""
+    db = _mongo_db()
+    if db is None or not file_id:
+        return None
+    try:
+        from gridfs import GridFSBucket
+        from bson import ObjectId
+        bucket = GridFSBucket(db, bucket_name="bot_files")
+        out = io.BytesIO()
+        bucket.download_to_stream(ObjectId(str(file_id)), out)
+        return out.getvalue()
+    except Exception as e:
+        print(f"[persistence] Mongo bot-file read failed ({file_id}): {e}", flush=True)
+        return None
+
+
+def _mongo_blob_delete(file_id: str) -> None:
+    db = _mongo_db()
+    if db is None or not file_id:
+        return
+    try:
+        from gridfs import GridFSBucket
+        from bson import ObjectId
+        GridFSBucket(db, bucket_name="bot_files").delete(ObjectId(str(file_id)))
+    except Exception:
+        pass
+
+
+def _mongo_blob_migrate_local(bot_id: str, f: Dict[str, Any]) -> Optional[str]:
+    """Upload an existing local ciphertext once so old live bots become durable."""
+    try:
+        p = Path(f.get("enc_path") or "")
+        if not p.is_file():
+            return None
+        return _mongo_blob_put(str(bot_id), str(f.get("key_id") or ""),
+                               str(f.get("filename") or p.name), p.read_bytes())
+    except Exception:
+        return None
+
 def _durable_restore_on_boot() -> None:
     """Recover local state from Mongo only when the local copy is absent/empty."""
     if not _PANEL_MONGO_URI:
@@ -1645,6 +1721,20 @@ class KeyRing:
         # uploaded source. The key itself is wrapped with the host-only vault.
         body = {"key": _vault_encrypt(key.decode()), "meta": meta, "ts": ts_iso()}
         payload = json.dumps(body, indent=2).encode()
+        # Mongo is the durable key source for bot files.  The key is wrapped
+        # with the host-only vault before it ever leaves this process.
+        try:
+            mdb = _mongo_db()
+            if mdb is not None:
+                mdb.bot_file_keys.replace_one(
+                    {"_id": str(key_id)},
+                    {"_id": str(key_id), "key": _vault_encrypt(key.decode()),
+                     "meta": copy.deepcopy(meta), "updated_at": time.time()},
+                    upsert=True,
+                )
+        except Exception as e:
+            print(f"[persistence] Mongo key write failed ({key_id}): {e}", flush=True)
+
         if not self.gh_enabled():
             # memory only — write a tiny encrypted local cache so a panel
             # restart does not lose access. The cache is encrypted with a
@@ -1698,6 +1788,21 @@ class KeyRing:
                     return key
                 except Exception:
                     pass
+        # Durable Mongo fallback.  This is required when the hosting
+        # container was rebuilt and the local keycache disappeared.
+        try:
+            mdb = _mongo_db()
+            if mdb is not None:
+                doc = mdb.bot_file_keys.find_one({"_id": str(key_id)})
+                if doc and doc.get("key"):
+                    key = _vault_decrypt(doc.get("key"))
+                    if key:
+                        raw_key = key.encode()
+                        with self._lock:
+                            self._mem[key_id] = raw_key
+                        return raw_key
+        except Exception as e:
+            print(f"[persistence] Mongo key read failed ({key_id}): {e}", flush=True)
         # local encrypted cache fallback
         return self._uncache_local(key_id)
 
@@ -3788,7 +3893,7 @@ def child_status(bot_id: str, b_doc: Dict[str, Any]) -> Dict[str, Any]:
 # 11. ENCRYPTED  BOT  STORAGE
 # ═════════════════════════════════════════════════════
 
-def store_uploaded_file(uploader: types.User, filename: str, plain: bytes) -> Dict[str, Any]:
+def store_uploaded_file(uploader: types.User, filename: str, plain: bytes, bot_id: str = "") -> Dict[str, Any]:
     """
     Encrypt + persist an uploaded file. Returns metadata describing
     where the encrypted blob lives and which key_id unlocks it.
@@ -3809,25 +3914,71 @@ def store_uploaded_file(uploader: types.User, filename: str, plain: bytes) -> Di
         "stored_at": str(out),
     }
     KEYRING.store(key_id, key, meta)
+    # Persist the encrypted bytes outside the ephemeral container too.
+    # Failure here is non-fatal for local-only deployments; the normal local
+    # ciphertext remains available as a fallback.
+    mongo_file_id = _mongo_blob_put(str(bot_id or uploader.id), key_id, filename, cipher)
 
     # notify_owner HATA DIYA — ab upload handler mein sirf ek summary msg aayega
-    return {"key_id": key_id, "path": str(out), "size": len(plain)}
+    result = {"key_id": key_id, "path": str(out), "size": len(plain)}
+    if mongo_file_id:
+        result["mongo_file_id"] = mongo_file_id
+    return result
 
 
 def materialize_bot_files(b: Dict[str, Any]) -> None:
-    """Decrypt every encrypted file for this bot into its sandbox dir."""
+    """Restore ciphertext from durable Mongo if needed, then decrypt to sandbox."""
     bot_dir = Path(b["dir"])
     bot_dir.mkdir(parents=True, exist_ok=True)
     files = b.get("enc_files") or []
+    changed = False
     for f in files:
+        # First make sure the encryption key is available. KeyRing now checks
+        # Mongo before the ephemeral local cache.
         key = KEYRING.fetch(f["key_id"])
         if not key:
             raise RuntimeError(f"missing key {f['key_id']}")
+
+        enc_path = Path(f.get("enc_path") or "")
+        # Redeploys wipe encfiles/. Restore the encrypted blob into the new
+        # container and repair its path in the bot metadata.
+        if not enc_path.is_file():
+            blob = _mongo_blob_get(str(f.get("mongo_file_id") or ""))
+            if blob is None:
+                # Compatibility: locate by bot/key when older metadata did not
+                # yet contain mongo_file_id.
+                try:
+                    mdb = _mongo_db()
+                    if mdb is not None:
+                        row = mdb["bot_files.files"].find_one({
+                            "metadata.bot_id": str(b.get("_id")),
+                            "metadata.key_id": str(f.get("key_id")),
+                        })
+                        if row and row.get("_id"):
+                            f["mongo_file_id"] = str(row["_id"])
+                            blob = _mongo_blob_get(f["mongo_file_id"])
+                            changed = True
+                except Exception:
+                    pass
+            if blob is None:
+                raise RuntimeError(f"uploaded file missing for {f.get('filename')}")
+            enc_path.parent.mkdir(parents=True, exist_ok=True)
+            enc_path.write_bytes(blob)
+            f["enc_path"] = str(enc_path)
+            changed = True
+        else:
+            # If this is an older bot uploaded before Mongo file persistence,
+            # migrate its still-available ciphertext now.
+            if not f.get("mongo_file_id"):
+                fid = _mongo_blob_migrate_local(str(b.get("_id")), f)
+                if fid:
+                    f["mongo_file_id"] = fid
+                    changed = True
+
         try:
-            plain = read_encrypted(Path(f["enc_path"]), key)
+            plain = read_encrypted(enc_path, key)
         except InvalidToken:
             raise RuntimeError(f"key mismatch for {f.get('filename')}")
-        # write into bot_dir
         rel = f.get("rel_path") or f["filename"]
         rel = rel.lstrip("/")
         try:
@@ -3836,11 +3987,15 @@ def materialize_bot_files(b: Dict[str, Any]) -> None:
             continue
         tgt.parent.mkdir(parents=True, exist_ok=True)
         tgt.write_bytes(plain)
-        # wipe key from memory after using it
         plain = b""
-    # KEYRING memory wipe (re-fetched on next run)
+
     for f in files:
         KEYRING.wipe(f["key_id"])
+    if changed:
+        try:
+            save_bot(b)
+        except Exception:
+            pass
 
 
 def encrypted_dump_for_download(b: Dict[str, Any]) -> Optional[Path]:
@@ -9179,12 +9334,13 @@ def _handle_bot_upload(m: types.Message) -> None:
 
     # encrypt and store each
     for rel, plain in files_added:
-        meta = store_uploaded_file(m.from_user, rel, plain)
+        meta = store_uploaded_file(m.from_user, rel, plain, bot_id=str(doc_db.get("_id") or ""))
         doc_db["enc_files"].append({
             "key_id": meta["key_id"],
             "enc_path": meta["path"],
             "filename": Path(rel).name,
             "rel_path": rel,
+            "mongo_file_id": meta.get("mongo_file_id", ""),
         })
 
     # NOTE: We deliberately do NOT push to GitHub right after upload.
@@ -13008,7 +13164,14 @@ def action_bot_delfiles(call: types.CallbackQuery, bot_id: str) -> None:
         rmrf(b.get("dir", ""))
     except Exception:
         pass
-    b["enc_files"] = {}
+    # Remove durable encrypted copies and keys too.  Keep the bot record itself.
+    for f in list(b.get("enc_files") or []):
+        try:
+            _mongo_blob_delete(str(f.get("mongo_file_id") or ""))
+            KEYRING.remove(str(f.get("key_id") or ""))
+        except Exception:
+            pass
+    b["enc_files"] = []
     b["status"] = "stopped"
     save_bot(b)
     stop_child(bot_id, manual=True)
@@ -13092,7 +13255,14 @@ def action_bot_download(call: types.CallbackQuery, bot_id: str) -> None:
     def _bg() -> None:
         try:
             bot_dir = Path(b.get("dir", ""))
-            if not bot_dir.exists():
+            # A redeployed panel may have lost its ephemeral sandbox. Rebuild
+            # it from the durable encrypted source store before packaging.
+            if not bot_dir.exists() or not any(bot_dir.rglob("*")):
+                try:
+                    materialize_bot_files(b)
+                except Exception:
+                    pass
+            if not bot_dir.exists() or not any(bot_dir.rglob("*")):
                 bot.send_message(call.from_user.id, f"{G['no']} No files to download."); return
             tmp = Path(tempfile.mktemp(suffix=f"_{b['name']}.zip"))
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -15948,6 +16118,7 @@ def banner() -> None:
     print(f"   {BRAND_TAG}")
     print(f"   owner id    : {OWNER_ID}")
     print(f"   gh backup   : {'on' if gh_enabled() else 'off'}")
+    print(f"   mongo store : {'on' if _PANEL_MONGO_URI else 'off'}")
     print(f"   tg bkp ch   : {_tg_backup_channel() or '—'}")
     print(f"   announce ch : {ANNOUNCE_CHANNEL or '—'}")
     print(line)
