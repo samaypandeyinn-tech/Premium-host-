@@ -9591,11 +9591,27 @@ def _acquire_singleton_lock() -> Optional[Any]:
         fh.flush()
         return fh
     except OSError:
-        sys.exit(
-            "[x] another panel instance is already running on this machine "
-            f"(see {lock_path}). Stop it first, otherwise every button press "
-            "will be processed twice."
-        )
+        # A host may briefly start a replacement process before the previous
+        # process has been reaped. Exiting here makes the platform restart the
+        # replacement again, creating the exact restart loop seen in logs.
+        # Keep this process alive instead; the already-running instance owns
+        # the health port and Telegram poller. If that instance dies, the lock
+        # is released and this process can acquire it on the next check.
+        print(f"[persistence] another local panel instance owns {lock_path}; waiting...", flush=True)
+        while True:
+            time.sleep(10)
+            try:
+                fh = open(lock_path, "w")
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fh.write(str(os.getpid()))
+                fh.flush()
+                print("[persistence] local panel lease acquired after waiting.", flush=True)
+                return fh
+            except OSError:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
 
 
 
@@ -16213,8 +16229,15 @@ def main() -> int:
                 stop_child(bid, manual=False)
             return 0
         except Exception as e:
+            msg = str(e)
             print(f"[bot] poll error: {e}", flush=True)
-            time.sleep(5)
+            # Telegram 409 means another process currently owns getUpdates.
+            # Do not hammer the API from both instances. Wait long enough for
+            # the distributed lease/old process to settle, then retry.
+            if "409" in msg or "Conflict: terminated by other getUpdates request" in msg:
+                time.sleep(20)
+            else:
+                time.sleep(5)
 
 
 
