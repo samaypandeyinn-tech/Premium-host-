@@ -2598,6 +2598,105 @@ _LOCK_FH_KEEPALIVE: Any = None             # singleton-lock fd, kept alive for t
 _runner_lock = threading.Lock()
 SECURE_EXEC = BASE_DIR / "secure_exec.py"
 
+# Persistent child-process registry. RUNNING is memory-only and disappears
+# whenever the panel is restarted; these small PID records let stop/delete
+# find and terminate an orphaned child instead of launching duplicates.
+_RUNNER_STATE_DIR = DIRS["data"] / "runner_pids"
+_RUNNER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _RUNNER_STATE_DIR.chmod(0o700)
+except Exception:
+    pass
+
+
+def _runner_state_path(bot_id: str) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(bot_id))
+    return _RUNNER_STATE_DIR / f"{safe_id}.json"
+
+
+def _proc_identity(pid: int) -> Optional[Dict[str, Any]]:
+    """Read Linux process identity fields used to avoid killing a reused PID."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text()
+        tail = raw[raw.rfind(")") + 2:].split()  # starts at field 3 (state)
+        start_ticks = int(tail[19])              # field 22
+        pgid = int(tail[2])                      # field 5
+        cwd = os.path.realpath(f"/proc/{int(pid)}/cwd")
+        return {"pid": int(pid), "pgid": pgid, "start_ticks": start_ticks, "cwd": cwd}
+    except Exception:
+        return None
+
+
+def _read_runner_state(bot_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(_runner_state_path(bot_id).read_text())
+        if not isinstance(data, dict):
+            return None
+        ident = _proc_identity(int(data.get("pid", 0)))
+        if not ident:
+            return None
+        if int(data.get("start_ticks", -1)) != ident["start_ticks"]:
+            return None
+        expected_dir = os.path.realpath(str(data.get("dir") or ""))
+        if not expected_dir or ident["cwd"] != expected_dir:
+            return None
+        return {**data, **ident, "dir": expected_dir}
+    except Exception:
+        return None
+
+
+def _write_runner_state(bot_id: str, pid: int, bot_dir: Path) -> None:
+    ident = _proc_identity(pid)
+    if not ident:
+        return
+    data = {
+        "pid": int(pid),
+        "pgid": int(ident["pgid"]),
+        "start_ticks": int(ident["start_ticks"]),
+        "dir": os.path.realpath(str(bot_dir)),
+        "started": time.time() * 1000,
+    }
+    _atomic_write(_runner_state_path(bot_id), data)
+
+
+def _clear_runner_state(bot_id: str) -> None:
+    try:
+        _runner_state_path(bot_id).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _stop_orphaned_child(bot_id: str) -> bool:
+    """Stop a child left behind by a previous panel process, if identity matches."""
+    state = _read_runner_state(bot_id)
+    if not state:
+        _clear_runner_state(bot_id)
+        return False
+    pid, pgid = int(state["pid"]), int(state["pgid"])
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        _clear_runner_state(bot_id)
+        return False
+    except Exception:
+        return False
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        current = _proc_identity(pid)
+        if not current or current["start_ticks"] != int(state["start_ticks"]):
+            _clear_runner_state(bot_id)
+            return True
+        time.sleep(0.1)
+    try:
+        # Revalidate before SIGKILL; never signal a PID that has been reused.
+        current = _proc_identity(pid)
+        if current and current["start_ticks"] == int(state["start_ticks"]):
+            os.killpg(pgid, signal.SIGKILL)
+    except Exception:
+        pass
+    _clear_runner_state(bot_id)
+    return True
+
 
 _SKIP_DIR_PARTS = {".deps", "node_modules", ".tmp_run", "__pycache__",
                    ".git", "venv", ".venv", "env"}
@@ -3319,6 +3418,7 @@ def _drain_proc(bot_id: str, proc: subprocess.Popen, log: List[str]) -> None:
     # crash-watch — auto-restart if plan supports it
     try:
         rc = proc.wait()
+        _clear_runner_state(bot_id)
         log.append(f"{G['div']} process exited rc={rc} {G['div']}")
         info = RUNNING.get(bot_id)
         was_manual = (info is None) or info.get("manual_stop", False)
@@ -3423,6 +3523,12 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
         existing = RUNNING.get(bid)
         if existing and existing["proc"].poll() is None:
             return {"ok": False, "error": "Already running."}
+    # A previous panel instance may have left this bot alive. Detect it by
+    # PID + process start time + working directory, and do not spawn a clone.
+    orphan_state = _read_runner_state(bid)
+    if orphan_state:
+        return {"ok": False, "error": f"Already running (recovered PID {orphan_state['pid']}). Stop it first."}
+    _clear_runner_state(bid)
     bot_dir = Path(b["dir"])
     if not bot_dir.exists():
         return {"ok": False, "error": "Bot folder missing."}
@@ -3493,6 +3599,9 @@ def start_child(b: Dict[str, Any]) -> Dict[str, Any]:
     }
     with _runner_lock:
         RUNNING[bid] = info
+    # Persist process identity immediately so Stop/Delete still works after
+    # a hosting-panel restart. The record contains no credentials.
+    _write_runner_state(bid, proc.pid, bot_dir)
     threading.Thread(target=_drain_proc, args=(bid, proc, log), daemon=True).start()
 
     # Enforce the RAM allowance attached to the owner's active plan.
@@ -3532,7 +3641,10 @@ def stop_child(bot_id: str, manual: bool = True) -> Dict[str, Any]:
     with _runner_lock:
         info = RUNNING.get(bot_id)
     if not info:
-        # Even if we don't have it tracked, make sure DB says stopped
+        # Recover the process group from disk when the panel was restarted.
+        # This is the key cleanup path for orphaned hosted bots.
+        _stop_orphaned_child(bot_id)
+        _clear_runner_state(bot_id)
         b = find_bot(bot_id)
         if b and b.get("status") != "stopped":
             b["status"] = "stopped"
@@ -3605,6 +3717,7 @@ def stop_child(bot_id: str, manual: bool = True) -> Dict[str, Any]:
         # try again instead of being stuck "running".
         with _runner_lock:
             RUNNING.pop(bot_id, None)
+        _clear_runner_state(bot_id)
         b = find_bot(bot_id)
         if b:
             b["status"] = "stopped"
@@ -3619,6 +3732,7 @@ def stop_child(bot_id: str, manual: bool = True) -> Dict[str, Any]:
 
     with _runner_lock:
         RUNNING.pop(bot_id, None)
+    _clear_runner_state(bot_id)
     b = find_bot(bot_id)
     if b:
         b["status"] = "stopped"
@@ -3856,6 +3970,9 @@ def tail_log(bot_id: str, lines: int = 60) -> str:
 def child_status(bot_id: str, b_doc: Dict[str, Any]) -> Dict[str, Any]:
     info = RUNNING.get(bot_id)
     running = bool(info and info["proc"].poll() is None)
+    recovered = None if running else _read_runner_state(bot_id)
+    if recovered:
+        running = True
     bot_dir = Path(b_doc.get("dir") or "")
     kind, _ = detect_entry(bot_dir) if bot_dir.exists() else (None, None)
     sz = 0
@@ -3869,18 +3986,20 @@ def child_status(bot_id: str, b_doc: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
     cpu = mem = 0.0
-    if running and psutil is not None:
+    active_pid = info["proc"].pid if info and running else (recovered["pid"] if recovered else None)
+    if running and psutil is not None and active_pid:
         try:
-            p = psutil.Process(info["proc"].pid)
+            p = psutil.Process(active_pid)
             cpu = p.cpu_percent(interval=0.05)
             mem = p.memory_info().rss
         except Exception:
             pass
+    active_started = info["started"] if info and running else (recovered.get("started", 0) if recovered else 0)
     return {
         "running":   running,
-        "pid":       info["proc"].pid if running else None,
+        "pid":       active_pid,
         "kind":      (info["kind"] if info else kind) or "—",
-        "uptimeMs":  int(time.time() * 1000 - info["started"]) if running else 0,
+        "uptimeMs":  int(time.time() * 1000 - active_started) if running and active_started else 0,
         "sizeBytes": sz,
         "logs":      info["log"] if info else [],
         "cpuPct":    cpu,
@@ -13176,6 +13295,9 @@ def action_bot_delfiles(call: types.CallbackQuery, bot_id: str) -> None:
     b = find_bot(bot_id)
     if not b or (b["owner"] != call.from_user.id and not is_admin(call.from_user.id)):
         ack(call, "Not yours"); return
+    # Stop the runtime before removing its working directory. Otherwise the
+    # child can keep running from deleted/replaced files and retain RAM.
+    stop_child(bot_id, manual=True)
     try:
         rmrf(b.get("dir", ""))
     except Exception:
@@ -13190,7 +13312,6 @@ def action_bot_delfiles(call: types.CallbackQuery, bot_id: str) -> None:
     b["enc_files"] = []
     b["status"] = "stopped"
     save_bot(b)
-    stop_child(bot_id, manual=True)
     audit(call.from_user.id, "bot_delfiles", f"bot={bot_id}")
     ack(call, "Files deleted")
     render_bot_view(call, bot_id)
